@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // QmdClient imports requestUrl from "obsidian" and spawn from "child_process".
 vi.mock("obsidian", () => ({ requestUrl: vi.fn() }));
-vi.mock("child_process", () => ({ spawn: vi.fn() }));
+vi.mock("../../src/qmd/shell", () => ({ spawn: vi.fn() }));
 
 import { requestUrl } from "obsidian";
 import {

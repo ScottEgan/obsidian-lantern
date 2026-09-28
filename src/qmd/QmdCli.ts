@@ -6,7 +6,7 @@
  * These commands mutate qmd's global index (~/.cache/qmd/index.sqlite).
  */
 
-import { execFile } from "child_process";
+import { execFile } from "./shell";
 import { commandEnv, resolveCommand } from "./processEnv";
 
 export interface QmdCliConfig {

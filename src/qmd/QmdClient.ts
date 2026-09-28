@@ -13,7 +13,7 @@
  */
 
 import { requestUrl } from "obsidian";
-import { spawn } from "child_process";
+import { spawn } from "./shell";
 import { commandEnv, resolveCommand } from "./processEnv";
 import { truncate, decodeUriSafe } from "../util";
 
