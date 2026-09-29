@@ -27,7 +27,7 @@ import type { QmdResult, QmdSearchMode } from "../qmd/QmdClient";
 import { resolveVaultPath, resolveVaultPaths } from "../qmd/vaultPath";
 import { readCollectionRoots, resolveWithinRoot } from "../qmd/qmdConfig";
 import { parseScopeTokens, describeScope, scopeCandidates, scopedFetchLimit } from "../search/scope";
-import { decodeUriSafe, errorMessage } from "../util";
+import { decodeUriSafe, errorMessage, durationSuffix, SECTION_SEP } from "../util";
 import { applyRecencyBoost, recencyFetchLimit } from "../search/rank";
 import type { ChatMessage, ReasoningEffort } from "../agent/LlmClient";
 import { isAbortError } from "../agent/LlmClient";
@@ -792,15 +792,19 @@ export class LanternView extends ItemView {
 			const queryText = parsed.hasScope ? parsed.rest : raw;
 			const externals = this.enabledSearchCollections();
 			const suffixBits = [scopeLabel ? `in ${scopeLabel}` : "", boost ? "recent-boosted" : ""].filter(Boolean);
-			const suffix = suffixBits.length > 0 ? ` · ${suffixBits.join(" · ")}` : "";
+			const suffix = suffixBits.length > 0 ? `${SECTION_SEP}${suffixBits.join(SECTION_SEP)}` : "";
 
-			// Vault group: scope + recency boost apply only here.
+			// Vault group: scope + recency boost apply only here. Start the clock
+			// here (setup above is sync) so it spans the qmd round trip, scope
+			// filtering / recency boost, and any parallel external queries — the
+			// wait the user actually experienced. Rendering is excluded.
+			const startedAt = performance.now();
 			const vaultResults = await this.searchVaultGroup(queryText, scope, boost, limit);
 			this.searchWarmedUp = true; // models are loaded now
 			if (raw !== this.currentQuery) return;
 
 			if (externals.length === 0) {
-				this.displayResults(vaultResults, suffix);
+				this.displayResults(vaultResults, suffix, this.msSince(startedAt));
 				return;
 			}
 
@@ -822,7 +826,8 @@ export class LanternView extends ItemView {
 
 			this.displayGroupedResults(
 				[{ label: "Vault", results: vaultResults }, ...externalGroups],
-				suffix
+				suffix,
+				this.msSince(startedAt)
 			);
 		} catch (error) {
 			if (raw !== this.currentQuery) return; // stale failure — keep newer state
@@ -830,6 +835,11 @@ export class LanternView extends ItemView {
 			this.setStatus(`Search failed — ${errorMessage(error)}`);
 			void this.refreshSetupCard();
 		}
+	}
+
+	/** Whole milliseconds elapsed since `startedAt` — the search status timer. */
+	private msSince(startedAt: number): number {
+		return Math.round(performance.now() - startedAt);
 	}
 
 	/** Search the vault collection, applying tag scope + recency boost. */
@@ -867,17 +877,19 @@ export class LanternView extends ItemView {
 		return results.slice(0, limit);
 	}
 
-	private displayResults(results: QmdResult[], statusSuffix = ""): void {
+	/** `elapsedMs` is the search's wall clock; it renders right after the count. */
+	private displayResults(results: QmdResult[], statusSuffix = "", elapsedMs?: number): void {
 		const container = this.searchResultsEl;
 		if (!container) return;
 		container.empty();
 
+		const timing = durationSuffix(elapsedMs);
 		if (results.length === 0) {
-			this.setStatus(`No results found${statusSuffix}`);
+			this.setStatus(`No results found${timing}${statusSuffix}`);
 			container.createDiv({ cls: "lantern-no-results", text: "No matching documents found." });
 			return;
 		}
-		this.setStatus(`${results.length} result${results.length === 1 ? "" : "s"}${statusSuffix}`);
+		this.setStatus(`${results.length} result${results.length === 1 ? "" : "s"}${timing}${statusSuffix}`);
 		for (const result of results) this.renderResultCard(container, result);
 	}
 
@@ -887,23 +899,28 @@ export class LanternView extends ItemView {
 	 * fused rank), so a single cross-collection call lets a large collection's
 	 * volume bury vault hits below minScore. Per-collection queries give each
 	 * source its own rank space, so every group's real top hits survive.
+	 *
+	 * `elapsedMs` is the search's wall clock (measured once, in performSearch,
+	 * across the vault and external queries in parallel).
 	 */
 	private displayGroupedResults(
 		groups: Array<{ label: string; results: QmdResult[] }>,
-		statusSuffix = ""
+		statusSuffix = "",
+		elapsedMs?: number
 	): void {
 		const container = this.searchResultsEl;
 		if (!container) return;
 		container.empty();
 
+		const timing = durationSuffix(elapsedMs);
 		const total = groups.reduce((n, g) => n + g.results.length, 0);
 		if (total === 0) {
-			this.setStatus(`No results found${statusSuffix}`);
+			this.setStatus(`No results found${timing}${statusSuffix}`);
 			container.createDiv({ cls: "lantern-no-results", text: "No matching documents found." });
 			return;
 		}
 		const sources = groups.filter((g) => g.results.length > 0).length;
-		this.setStatus(`${total} result${total === 1 ? "" : "s"} across ${sources} source${sources === 1 ? "" : "s"}${statusSuffix}`);
+		this.setStatus(`${total} result${total === 1 ? "" : "s"} across ${sources} source${sources === 1 ? "" : "s"}${timing}${statusSuffix}`);
 
 		for (const group of groups) {
 			if (group.results.length === 0) continue;
