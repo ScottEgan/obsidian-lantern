@@ -936,7 +936,7 @@ export class LanternView extends ItemView {
 		const el = container.createDiv({ cls: "lantern-result" });
 		const header = el.createDiv({ cls: "lantern-result-header" });
 		const title = header.createSpan({ cls: "lantern-result-path", text: result.title || result.path });
-		title.addEventListener("click", (evt) => {
+		this.onNoteLink(title, (evt) => {
 			void this.openResult(result, evt);
 		});
 
@@ -998,7 +998,7 @@ export class LanternView extends ItemView {
 			const el = container.createDiv({ cls: "lantern-result lantern-result-compact" });
 			const header = el.createDiv({ cls: "lantern-result-header" });
 			const title = header.createSpan({ cls: "lantern-result-path", text: file.basename });
-			title.addEventListener("click", (evt) => {
+			this.onNoteLink(title, (evt) => {
 				void this.app.workspace.getLeaf(this.wantsNewTab(evt)).openFile(file);
 			});
 			el.createDiv({ cls: "lantern-result-breadcrumb", text: file.path });
@@ -1012,9 +1012,29 @@ export class LanternView extends ItemView {
 	}
 
 	/**
-	 * True when the click asked for a new tab (ctrl/cmd-click, or middle-click) —
-	 * the same modifier set handleLinkClick honors for [[wikilinks]], so every
-	 * Lantern link behaves identically. Plain click stays in the current tab.
+	 * Wire a note link so plain click opens the current tab while a middle click
+	 * opens a new one. Chromium delivers the middle button as `auxclick` and
+	 * never as `click`, so both listeners are required. `auxclick` also fires for
+	 * the right button — filtered out here so the context menu still opens.
+	 */
+	private onNoteLink(el: HTMLElement, handler: (evt: MouseEvent) => void): void {
+		// Suppress the middle-drag autoscroll gesture, which otherwise fires over
+		// a scrollable pane and competes with the click.
+		el.addEventListener("mousedown", (evt) => {
+			if (evt.button === 1) evt.preventDefault();
+		});
+		el.addEventListener("click", handler);
+		el.addEventListener("auxclick", (evt) => {
+			if (evt.button !== 1) return;
+			evt.preventDefault();
+			handler(evt);
+		});
+	}
+
+	/**
+	 * True when the click asked for a new tab: ctrl/cmd-click (which arrives as a
+	 * normal `click`) or a middle click (which arrives as `auxclick` — see
+	 * onNoteLink). Plain click stays in the current tab.
 	 */
 	private wantsNewTab(evt: MouseEvent): boolean {
 		return evt.ctrlKey || evt.metaKey || evt.button === 1;
@@ -1843,7 +1863,7 @@ export class LanternView extends ItemView {
 	/** A clickable note-path link inside the trace. */
 	private tracePathLink(parent: HTMLElement, path: string, line?: number, label?: string): void {
 		const el = parent.createSpan({ cls: "lantern-trace-path", text: label ?? path, attr: { title: path } });
-		el.addEventListener("click", (evt) => {
+		this.onNoteLink(el, (evt) => {
 			evt.preventDefault();
 			evt.stopPropagation();
 			this.openTracePath(path, evt, line);
