@@ -936,8 +936,8 @@ export class LanternView extends ItemView {
 		const el = container.createDiv({ cls: "lantern-result" });
 		const header = el.createDiv({ cls: "lantern-result-header" });
 		const title = header.createSpan({ cls: "lantern-result-path", text: result.title || result.path });
-		title.addEventListener("click", () => {
-			void this.openResult(result);
+		title.addEventListener("click", (evt) => {
+			void this.openResult(result, evt);
 		});
 
 		const isVault = result.collection === this.plugin.settings.vaultCollection;
@@ -998,8 +998,8 @@ export class LanternView extends ItemView {
 			const el = container.createDiv({ cls: "lantern-result lantern-result-compact" });
 			const header = el.createDiv({ cls: "lantern-result-header" });
 			const title = header.createSpan({ cls: "lantern-result-path", text: file.basename });
-			title.addEventListener("click", () => {
-				void this.app.workspace.getLeaf(false).openFile(file);
+			title.addEventListener("click", (evt) => {
+				void this.app.workspace.getLeaf(this.wantsNewTab(evt)).openFile(file);
 			});
 			el.createDiv({ cls: "lantern-result-breadcrumb", text: file.path });
 		}
@@ -1011,7 +1011,16 @@ export class LanternView extends ItemView {
 		}
 	}
 
-	private async openResult(result: QmdResult): Promise<void> {
+	/**
+	 * True when the click asked for a new tab (ctrl/cmd-click, or middle-click) —
+	 * the same modifier set handleLinkClick honors for [[wikilinks]], so every
+	 * Lantern link behaves identically. Plain click stays in the current tab.
+	 */
+	private wantsNewTab(evt: MouseEvent): boolean {
+		return evt.ctrlKey || evt.metaKey || evt.button === 1;
+	}
+
+	private async openResult(result: QmdResult, evt: MouseEvent): Promise<void> {
 		if (result.collection !== this.plugin.settings.vaultCollection) {
 			await this.openExternalResult(result);
 			return;
@@ -1022,7 +1031,7 @@ export class LanternView extends ItemView {
 			new Notice(`File not found in vault: ${result.path}`);
 			return;
 		}
-		const leaf = this.app.workspace.getLeaf(false);
+		const leaf = this.app.workspace.getLeaf(this.wantsNewTab(evt));
 		await leaf.openFile(file, { eState: { line: Math.max(0, result.line - 1) } });
 	}
 
@@ -1814,8 +1823,12 @@ export class LanternView extends ItemView {
 		}
 	}
 
-	/** Open a vault note from a trace row (loose resolution, jump to line). */
-	private openTracePath(path: string, line?: number): void {
+	/**
+	 * Open a vault note from a trace row (loose resolution, jump to line).
+	 * `evt` comes before the optional `line` so the click's modifiers can
+	 * decide whether it opens in a new tab.
+	 */
+	private openTracePath(path: string, evt: MouseEvent, line?: number): void {
 		const real = resolveVaultPath(this.app, path) ?? path;
 		const file = this.app.vault.getAbstractFileByPath(real);
 		if (!(file instanceof TFile)) {
@@ -1823,7 +1836,7 @@ export class LanternView extends ItemView {
 			return;
 		}
 		void this.app.workspace
-			.getLeaf(false)
+			.getLeaf(this.wantsNewTab(evt))
 			.openFile(file, line ? { eState: { line: Math.max(0, line - 1) } } : undefined);
 	}
 
@@ -1833,7 +1846,7 @@ export class LanternView extends ItemView {
 		el.addEventListener("click", (evt) => {
 			evt.preventDefault();
 			evt.stopPropagation();
-			this.openTracePath(path, line);
+			this.openTracePath(path, evt, line);
 		});
 	}
 
