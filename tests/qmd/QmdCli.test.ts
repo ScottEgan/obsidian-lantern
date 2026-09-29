@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-vi.mock("child_process", () => ({ execFile: vi.fn() }));
+vi.mock("../../src/qmd/shell", () => ({ execFile: vi.fn() }));
 
-import { execFile } from "child_process";
+import { execFile } from "../../src/qmd/shell";
 import { QmdCli, parseCollectionNames, parseUpdateOutput, hasChanges } from "../../src/qmd/QmdCli";
 
 const mockExecFile = vi.mocked(execFile);
