@@ -24,8 +24,9 @@ import { DEFAULT_SYSTEM_PROMPT } from "../agent/AgentLoop";
 import { PROMPT_DEFS, resolvePrompt, missingPlaceholders, type PromptDef } from "../agent/promptRegistry";
 import { isValidCollectionName, type LanternSettings } from "../settings";
 import type LanternPlugin from "../main";
+import { describeIndexStatus } from "../qmd/indexStatus";
 
-type StatState = "idle" | "checking" | "ok" | "fail";
+type StatState = "idle" | "checking" | "ok" | "warn" | "fail";
 
 interface StatRow {
 	button: HTMLButtonElement;
@@ -37,6 +38,8 @@ export class LanternSettingTab extends PluginSettingTab {
 
 	/** Re-probe the qmd overview row; set while the overview is mounted. */
 	private refreshQmdStat: (() => Promise<void>) | null = null;
+	/** Stops the live index-status updates of the overview row. */
+	private unsubscribeIndex: (() => void) | null = null;
 	/** Status line under the system-prompt-note setting. */
 	private promptStatusEl: HTMLElement | null = null;
 	/** Which screen is showing: the main tab, or a sub-editor reached via a button. */
@@ -49,6 +52,7 @@ export class LanternSettingTab extends PluginSettingTab {
 
 	display(): void {
 		const { containerEl } = this;
+		this.unsubscribeIndex?.();
 		containerEl.empty();
 		containerEl.addClass("lantern-settings");
 		if (this.screen === "prompts") return void this.renderPromptsScreen(containerEl);
@@ -59,6 +63,7 @@ export class LanternSettingTab extends PluginSettingTab {
 	/** Reset to the main screen when the settings tab is (re)opened. */
 	hide(): void {
 		this.screen = "main";
+		this.unsubscribeIndex?.();
 	}
 
 	/** Switch screen and re-render — scrolling to the top so a sub-screen never
@@ -142,7 +147,19 @@ export class LanternSettingTab extends PluginSettingTab {
 			.addToggle((toggle) =>
 				toggle.setValue(this.plugin.settings.autoUpdateOnChange).onChange(async (value) => {
 					this.plugin.settings.autoUpdateOnChange = value;
-					await this.plugin.saveSettings(); // re-registers file events live
+					await this.plugin.saveSettings(); // arms/disarms auto-update live
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Show index status in the status bar")
+			.setDesc(
+				"While the vault index is behind or busy: changed notes with the auto-update countdown, qmd update/embed with elapsed time, a skipped or failed run. Click it to update. The status overview above shows the same."
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.showIndexStatus).onChange(async (value) => {
+					this.plugin.settings.showIndexStatus = value;
+					await this.plugin.saveSettings();
 				})
 			);
 
@@ -948,11 +965,36 @@ export class LanternSettingTab extends PluginSettingTab {
 				qmd.set("fail", `Not reachable on port ${this.plugin.settings.qmdPort}`);
 				return;
 			}
-			const indexed = await this.plugin.isVaultIndexed();
-			qmd.set(
-				"ok",
-				`Running on port ${this.plugin.settings.qmdPort} · ${indexed ? "vault indexed" : "vault not registered"}`
-			);
+			const [indexed, info] = await Promise.all([this.plugin.isVaultIndexed(), this.plugin.getQmdVersion()]);
+			const version = info?.version ? `qmd ${info.version} · ` : "";
+			if (info && !info.supported) {
+				this.unsubscribeIndex?.();
+				qmd.set("fail", `${version}needs ${info.minimum}+ · npm install -g @tobilu/qmd`);
+				return;
+			}
+			const prefix = `${version}port ${this.plugin.settings.qmdPort} · `;
+			if (!indexed) {
+				this.unsubscribeIndex?.();
+				qmd.set("ok", `${prefix}vault not registered`);
+				return;
+			}
+			// Live while the overview is open: pending changes, update/embed runs.
+			const tracker = this.plugin.indexTracker;
+			const render = () => {
+				const view = describeIndexStatus(tracker.status, Date.now());
+				const state: StatState =
+					view.level === "ok" ? "ok" : view.level === "error" ? "fail" : view.level === "running" ? "checking" : "warn";
+				qmd.set(state, prefix + view.detail);
+			};
+			this.unsubscribeIndex?.();
+			const unsubscribe = tracker.subscribe(render);
+			const timer = window.setInterval(render, 1000);
+			this.unsubscribeIndex = () => {
+				unsubscribe();
+				window.clearInterval(timer);
+				this.unsubscribeIndex = null;
+			};
+			render();
 		};
 		qmd.button.addEventListener("click", () => void checkQmd());
 		this.refreshQmdStat = checkQmd;

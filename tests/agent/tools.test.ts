@@ -430,6 +430,50 @@ describe("buildTools", () => {
 			expect(out).not.toMatch(/check the path/i);
 		});
 
+		it("read_reference falls back to qmd's indexed copy when the root is gone", async () => {
+			const getDocument = vi.fn().mockResolvedValue({
+				ok: true,
+				collection: "pmbokguide",
+				path: "scope/control.md",
+				text: "# Control Scope\nFrom the index",
+			});
+			const tools = buildTools(app, qmd, refOpts(["pmbokguide"], {
+				rootExists: () => false,
+				readFile: async () => {
+					throw new Error("ENOENT");
+				},
+				getDocument,
+			}));
+			const out = await tools.read_reference.execute({ collection: "pmbokguide", path: "scope/control.md" });
+			expect(getDocument).toHaveBeenCalledWith("pmbokguide", "scope/control.md");
+			expect(out).toMatch(/read from qmd's indexed copy/);
+			expect(out).toMatch(/no longer exists on disk/);
+			expect(out).toContain("2: From the index");
+		});
+
+		it("read_reference uses the index for a collection missing from index.yml", async () => {
+			const getDocument = vi.fn().mockResolvedValue({ ok: true, collection: "apple-docs", path: "x.md", text: "hello" });
+			const tools = buildTools(app, qmd, refOpts(["pmbokguide", "apple-docs"], { getDocument }));
+			const out = await tools.read_reference.execute({ collection: "apple-docs", path: "x.md" });
+			expect(out).toMatch(/isn't in qmd's index.yml/);
+			expect(out).toContain("1: hello");
+		});
+
+		it("read_reference passes qmd's suggestions through when both reads miss", async () => {
+			const getDocument = vi.fn().mockResolvedValue({ ok: false, error: "Document not found", suggestions: ["pmbokguide/scope/ctrl.md"] });
+			const tools = buildTools(app, qmd, refOpts(["pmbokguide"], { getDocument }));
+			const out = await tools.read_reference.execute({ collection: "pmbokguide", path: "ghost.md" });
+			expect(out).toMatch(/qmd suggests: pmbokguide\/scope\/ctrl\.md/);
+		});
+
+		it("read_reference rejects traversal before asking qmd, and ignores a doc from another collection", async () => {
+			const getDocument = vi.fn().mockResolvedValue({ ok: true, collection: "other", path: "x.md", text: "nope" });
+			const tools = buildTools(app, qmd, refOpts(["pmbokguide", "apple-docs"], { getDocument }));
+			expect(await tools.read_reference.execute({ collection: "apple-docs", path: "../x.md" })).toMatch(/may not contain/);
+			expect(getDocument).not.toHaveBeenCalled();
+			expect(await tools.read_reference.execute({ collection: "apple-docs", path: "x.md" })).toMatch(/root folder .* unknown/);
+		});
+
 		it("reference tools are absent when no collections are configured", () => {
 			const tools = buildTools(app, qmd);
 			expect(tools.search_references).toBeUndefined();

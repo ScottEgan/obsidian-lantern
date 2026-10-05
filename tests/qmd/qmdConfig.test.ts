@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { parseCollectionRoots, qmdConfigPath, resolveWithinRoot } from "../../src/qmd/qmdConfig";
+import {
+	parseCollectionRoots,
+	qmdConfigPath,
+	resolveWithinRoot,
+	qmdEmbedLockPath,
+	embedLockHolder,
+} from "../../src/qmd/qmdConfig";
 
 /** Mirrors the real ~/.config/qmd/index.yml shape (verified on-machine). */
 const SAMPLE_YAML = `collections:
@@ -50,6 +56,10 @@ describe("qmdConfigPath", () => {
 	it("respects XDG_CONFIG_HOME", () => {
 		expect(qmdConfigPath({ XDG_CONFIG_HOME: "/xdg" }, "/Users/me")).toBe("/xdg/qmd/index.yml");
 	});
+
+	it("prefers QMD_CONFIG_DIR over XDG_CONFIG_HOME (qmd's own precedence)", () => {
+		expect(qmdConfigPath({ QMD_CONFIG_DIR: "/cfg", XDG_CONFIG_HOME: "/xdg" }, "/Users/me")).toBe("/cfg/index.yml");
+	});
 });
 
 describe("resolveWithinRoot", () => {
@@ -76,5 +86,28 @@ describe("resolveWithinRoot", () => {
 
 	it("allows the root itself and a dotfile inside it", () => {
 		expect(resolveWithinRoot(root, ".hidden.md")).toBe("/refs/pmbok/.hidden.md");
+	});
+});
+
+describe("qmd embed lock", () => {
+	it("sits next to qmd's index DB (INDEX_PATH > XDG_CACHE_HOME > ~/.cache)", () => {
+		expect(qmdEmbedLockPath({}, "/Users/me")).toBe("/Users/me/.cache/qmd/.qmd-embed.lock");
+		expect(qmdEmbedLockPath({ XDG_CACHE_HOME: "/xc" }, "/Users/me")).toBe("/xc/qmd/.qmd-embed.lock");
+		expect(qmdEmbedLockPath({ INDEX_PATH: "/db/i.sqlite", XDG_CACHE_HOME: "/xc" }, "/Users/me")).toBe("/db/.qmd-embed.lock");
+	});
+
+	it("returns the holder PID only for a live process", () => {
+		expect(embedLockHolder("/l", () => "4242\n", () => true)).toBe(4242);
+		expect(embedLockHolder("/l", () => "4242\n", () => false)).toBeNull(); // stale lock
+		expect(embedLockHolder("/l", () => "garbage", () => true)).toBeNull();
+		expect(
+			embedLockHolder(
+				"/l",
+				() => {
+					throw new Error("ENOENT");
+				},
+				() => true
+			)
+		).toBeNull();
 	});
 });

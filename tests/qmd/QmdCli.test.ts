@@ -3,7 +3,17 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("../../src/qmd/shell", () => ({ execFile: vi.fn() }));
 
 import { execFile } from "../../src/qmd/shell";
-import { QmdCli, parseCollectionNames, parseUpdateOutput, hasChanges } from "../../src/qmd/QmdCli";
+import { homedir } from "os";
+import {
+	QmdCli,
+	parseCollectionNames,
+	parseUpdateOutput,
+	hasChanges,
+	parseQmdVersion,
+	compareVersions,
+	isEmbedLockBusy,
+	MIN_QMD_VERSION,
+} from "../../src/qmd/QmdCli";
 
 const mockExecFile = vi.mocked(execFile);
 
@@ -176,10 +186,60 @@ describe("QmdCli", () => {
 		await expect(cli.listCollectionNames()).rejects.toThrow(/collection list failed: config corrupted/);
 	});
 
+	it.each(["ETIMEDOUT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"])("keeps %s diagnostics visible even with partial output", async (code) => {
+		mockExec(Object.assign(new Error("wrapper failure details"), { code }), "partial stdout", "partial stderr");
+		const result = await cli.update();
+		expect(result).toEqual({ code: 1, stdout: "partial stdout", stderr: "partial stderr\nwrapper failure details" });
+	});
+
+	it("uses the error message when a numeric failure has no output", async () => {
+		mockExec(Object.assign(new Error("command failed without output"), { code: 7 }));
+		expect(await cli.update()).toEqual({ code: 7, stdout: "", stderr: "command failed without output" });
+	});
+
+	it("preserves indexing's no-timeout policy and the short-command timeout/output limit", async () => {
+		mockExec(null);
+		await cli.embed();
+		expect(mockExecFile.mock.calls[0][2]).toMatchObject({ timeout: 0, maxBuffer: 64 * 1024 * 1024 });
+		await cli.version();
+		expect(mockExecFile.mock.calls[1][2]).toMatchObject({ timeout: 15000, maxBuffer: 64 * 1024 * 1024 });
+	});
+
 	it("version runs qmd --version", async () => {
 		mockExec(null, "qmd 2.5.3 (6366024)", "");
 		const res = await cli.version();
 		expect(res.code).toBe(0);
 		expect(mockExecFile.mock.calls[0][1]).toEqual(["--version"]);
+	});
+});
+
+describe("parseQmdVersion / compareVersions", () => {
+	it("parses `qmd --version` output (release and source builds)", () => {
+		expect(parseQmdVersion("qmd 2.8.3 (dbfd0b4-dirty)\n")).toBe("2.8.3");
+		expect(parseQmdVersion("qmd 2.5.3")).toBe("2.5.3");
+		expect(parseQmdVersion("qmd v3.0.0")).toBe("3.0.0");
+		expect(parseQmdVersion("nonsense")).toBeNull();
+	});
+
+	it("compares numerically, not lexically", () => {
+		expect(compareVersions("2.10.0", "2.8.3")).toBeGreaterThan(0);
+		expect(compareVersions("2.5.3", MIN_QMD_VERSION)).toBeLessThan(0);
+		expect(compareVersions("2.8.3", MIN_QMD_VERSION)).toBe(0);
+	});
+});
+
+describe("isEmbedLockBusy", () => {
+	it("detects qmd 2.8's embed-lock skip message", () => {
+		expect(isEmbedLockBusy("Another embed process is already running. Skipping.\n")).toBe(true);
+		expect(isEmbedLockBusy("✓ All content hashes already have embeddings.")).toBe(false);
+	});
+});
+
+describe("QmdCli working directory", () => {
+	it("runs qmd from the home directory (a project-local .qmd/ would swap the index)", async () => {
+		mockExec(null, "qmd 2.8.3");
+		await new QmdCli({ binaryPath: "qmd" }).version();
+		const opts = mockExecFile.mock.calls[0][2] as { cwd?: string };
+		expect(opts.cwd).toBe(homedir());
 	});
 });

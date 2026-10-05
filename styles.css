@@ -529,6 +529,10 @@
 	background: var(--color-yellow);
 	animation: lantern-pulse 1s ease-in-out infinite;
 }
+.lantern-settings .lantern-stat-dot.is-warn {
+	background: var(--color-orange);
+	box-shadow: 0 0 0 3px rgba(var(--color-orange-rgb, 230, 140, 50), 0.18);
+}
 @keyframes lantern-pulse {
 	0%, 100% { opacity: 1; }
 	50% { opacity: 0.3; }
@@ -1009,4 +1013,36 @@
 }
 .lantern-result-group:first-child {
 	margin-top: 0;
+}
+
+/* Vault index status (status bar) — shown only while something is pending or running. */
+.lantern-index-status {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--size-4-1);
+}
+.lantern-index-status.lantern-hidden {
+	display: none;
+}
+.lantern-index-status-icon,
+.lantern-index-status-spinner {
+	display: inline-flex;
+}
+.lantern-index-status-icon svg,
+.lantern-index-status-spinner svg {
+	width: var(--icon-xs);
+	height: var(--icon-xs);
+}
+.lantern-index-status[data-level="pending"] .lantern-index-status-icon,
+.lantern-index-status[data-level="warn"] .lantern-index-status-icon {
+	color: var(--color-orange);
+}
+.lantern-index-status[data-level="error"] .lantern-index-status-icon {
+	color: var(--color-red);
+}
+.lantern-index-status-spinner svg {
+	animation: lantern-spin 1.2s linear infinite;
+}
+@keyframes lantern-spin {
+	to { transform: rotate(360deg); }
 }

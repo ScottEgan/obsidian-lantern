@@ -82,6 +82,17 @@ export function commandEnv(host: HostInfo = realHost()): NodeJS.ProcessEnv {
 	return { ...host.env, [key]: path };
 }
 
+/**
+ * Working directory for qmd child processes. Without `--index`, qmd walks up
+ * from its cwd looking for a project-local `.qmd/index.yml` and, if found,
+ * swaps in that project's config AND index database. Obsidian's cwd is
+ * whatever launched it, so pin the home directory: the CLI and the daemon then
+ * always share the global index that Lantern reads collection roots from.
+ */
+export function commandCwd(host: HostInfo = realHost()): string {
+	return host.home;
+}
+
 /** True when the value is an explicit path rather than a bare command name. */
 export function isExplicitPath(binaryPath: string, platform: NodeJS.Platform = process.platform): boolean {
 	if (binaryPath.includes("/")) return true;

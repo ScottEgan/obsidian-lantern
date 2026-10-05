@@ -7,7 +7,7 @@
  */
 
 import { execFile } from "./shell";
-import { commandEnv, resolveCommand } from "./processEnv";
+import { commandCwd, commandEnv, resolveCommand } from "./processEnv";
 
 export interface QmdCliConfig {
 	/** Path to the qmd binary. */
@@ -19,6 +19,38 @@ export interface QmdExecResult {
 	code: number;
 	stdout: string;
 	stderr: string;
+}
+
+/**
+ * Oldest qmd Lantern supports: the first release that stores literal file
+ * paths (≤2.5.3 returned slugs that don't round-trip to vault files) and
+ * serves stateless MCP over HTTP (used by read_reference's indexed-copy read).
+ */
+export const MIN_QMD_VERSION = "2.8.3";
+
+/** Version from `qmd --version` output (`qmd 2.8.3 (dbfd0b4)`), or null. */
+export function parseQmdVersion(output: string): string | null {
+	const match = output.match(/\bqmd\s+v?(\d+\.\d+\.\d+)/i) ?? output.match(/\b(\d+\.\d+\.\d+)\b/);
+	return match ? match[1] : null;
+}
+
+/** Numeric dotted-version compare: <0 when a < b, 0 when equal, >0 when a > b. */
+export function compareVersions(a: string, b: string): number {
+	const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
+	const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
+	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+		const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+		if (d !== 0) return d;
+	}
+	return 0;
+}
+
+/**
+ * qmd ≥2.8 serializes `qmd embed` behind a process lock; a second embed prints
+ * this and exits 0 WITHOUT embedding (e.g. while another collection embeds).
+ */
+export function isEmbedLockBusy(output: string): boolean {
+	return /Another embed process is already running/i.test(output);
 }
 
 /** qmd's default glob for markdown collections. */
@@ -104,10 +136,10 @@ export class QmdCli {
 			execFile(
 				resolveCommand(this.config.binaryPath),
 				args,
-				{ timeout: timeoutMs, maxBuffer: MAX_BUFFER, env: commandEnv() },
+				{ timeout: timeoutMs, maxBuffer: MAX_BUFFER, env: commandEnv(), cwd: commandCwd() },
 				(error, stdout, stderr) => {
 					const out = stdout?.toString() ?? "";
-					const err = stderr?.toString() ?? "";
+					let err = stderr?.toString() ?? "";
 
 					// execFile sets `code` to "ENOENT" (string) for a missing binary,
 					// or the numeric exit code for a non-zero exit.
@@ -124,6 +156,11 @@ export class QmdCli {
 					}
 
 					const code = typeof rawCode === "number" ? rawCode : error ? 1 : 0;
+					// Wrapper failures must remain visible even if qmd produced partial
+					// output. Ordinary numeric failures retain qmd's own diagnostics.
+					if (error && (typeof rawCode !== "number" || (!out.trim() && !err.trim()))) {
+						err = [err.trimEnd(), error.message].filter(Boolean).join("\n");
+					}
 					resolve({ code, stdout: out, stderr: err });
 				}
 			);
@@ -172,8 +209,9 @@ export class QmdCli {
 	/**
 	 * Attach a human-written context summary to a collection root, improving
 	 * ranking (`qmd context add qmd://<name>/ "<text>"`). Re-adding the root
-	 * overwrites (qmd keys contexts by path prefix). Args go through execFile's
-	 * argv (no shell), so the text is passed literally — no quoting needed.
+	 * overwrites (qmd keys contexts by path prefix). Callers pass unquoted argv;
+	 * the launch adapter handles Windows npm/pnpm shim escaping and flattens
+	 * CR/LF runs to spaces on that route only. Direct launches preserve text.
 	 */
 	async setContext(collection: string, text: string): Promise<QmdExecResult> {
 		return this.run(["context", "add", `qmd://${collection}/`, text], LIST_TIMEOUT_MS);

@@ -5,14 +5,23 @@
  * and exposes the high-level operations main.ts needs: ensure the daemon is up,
  * register/refresh the vault as a qmd collection, and run searches scoped to it.
  *
- * Note on freshness: the qmd (≥2.5.3) daemon reads its SQLite index per query
+ * Note on freshness: the qmd daemon reads its SQLite index per query
  * — verified empirically (a collection added/removed via the CLI is visible to
  * a long-running daemon immediately) — so no daemon restart is needed after
  * indexing, and the warm models survive reindexes.
  */
 
-import { QmdClient, type QmdResult, type QmdSearchMode } from "./QmdClient";
-import { QmdCli, parseUpdateOutput, hasChanges, type UpdateCounts } from "./QmdCli";
+import { QmdClient, type QmdDocument, type QmdResult, type QmdSearchMode } from "./QmdClient";
+import {
+	QmdCli,
+	MIN_QMD_VERSION,
+	compareVersions,
+	hasChanges,
+	isEmbedLockBusy,
+	parseQmdVersion,
+	parseUpdateOutput,
+	type UpdateCounts,
+} from "./QmdCli";
 
 export interface QmdServiceConfig {
 	/** Path to the qmd binary. */
@@ -52,6 +61,14 @@ export interface QmdSearchOptions {
 	minScore?: number;
 }
 
+/** Observer for indexing runs (status bar / settings). */
+export interface IndexRunListener {
+	onStart?(): void;
+	onPhase?(phase: "indexing" | "embedding"): void;
+	onDone?(result: ReindexResult): void;
+	onError?(error: unknown): void;
+}
+
 export interface QmdServiceDeps {
 	client?: QmdClient;
 	cli?: QmdCli;
@@ -65,6 +82,19 @@ export interface ReindexResult {
 	counts: UpdateCounts | null;
 	/** True when an embed pass ran (false = skipped, nothing changed). */
 	embedded: boolean;
+	/**
+	 * True when qmd skipped the embed because another `qmd embed` held its
+	 * process lock — text is indexed, vectors are not; re-run later.
+	 */
+	embedBusy?: boolean;
+}
+
+/** Installed qmd version vs Lantern's minimum (`version` null = unparseable). */
+export interface QmdVersionInfo {
+	version: string | null;
+	minimum: string;
+	/** False only when the version parsed AND is below the minimum. */
+	supported: boolean;
 }
 
 export class QmdService {
@@ -74,6 +104,13 @@ export class QmdService {
 	private vaultPath: string | null = null;
 	/** In-flight indexing op; concurrent register/reindex requests share it. */
 	private indexingOp: Promise<ReindexResult> | null = null;
+	/**
+	 * The last embed was skipped by qmd's embed lock. The next reindex embeds
+	 * even when `qmd update` reports no text changes — otherwise the skipped
+	 * vectors would never be generated.
+	 */
+	private embedPending = false;
+	private runListener: IndexRunListener = {};
 
 	constructor(config: QmdServiceConfig, deps: QmdServiceDeps = {}) {
 		this.config = config;
@@ -86,6 +123,10 @@ export class QmdService {
 	/** Absolute on-disk path of the vault (set by main on load). */
 	setVaultPath(path: string): void {
 		this.vaultPath = path;
+	}
+
+	setRunListener(listener: IndexRunListener): void {
+		this.runListener = listener;
 	}
 
 	updateConfig(partial: Partial<QmdServiceConfig>): void {
@@ -131,6 +172,22 @@ export class QmdService {
 		}
 	}
 
+	/** `qmd --version`, checked against MIN_QMD_VERSION. Throws if the binary is missing. */
+	async getVersion(): Promise<QmdVersionInfo> {
+		const res = await this.cli.version();
+		const version = parseQmdVersion(`${res.stdout}\n${res.stderr}`);
+		return {
+			version,
+			minimum: MIN_QMD_VERSION,
+			supported: version === null || compareVersions(version, MIN_QMD_VERSION) >= 0,
+		};
+	}
+
+	/** Read one document's indexed body from qmd (collection + path within it). */
+	async getDocument(collection: string, path: string): Promise<QmdDocument> {
+		return this.client.getDocument(`${collection}/${path}`);
+	}
+
 	/** Register the vault as a qmd collection (if needed) and embed it. */
 	ensureVaultIndexed(): Promise<ReindexResult> {
 		return this.runExclusiveIndexing(() => this.doEnsureVaultIndexed());
@@ -147,11 +204,29 @@ export class QmdService {
 
 	private runExclusiveIndexing(fn: () => Promise<ReindexResult>): Promise<ReindexResult> {
 		if (!this.indexingOp) {
-			this.indexingOp = fn().finally(() => {
-				this.indexingOp = null;
-			});
+			const listener = this.runListener;
+			listener.onStart?.();
+			this.indexingOp = fn()
+				.then(
+					(result) => {
+						listener.onDone?.(result);
+						return result;
+					},
+					(error: unknown) => {
+						listener.onError?.(error);
+						throw error;
+					}
+				)
+				.finally(() => {
+					this.indexingOp = null;
+				});
 		}
 		return this.indexingOp;
+	}
+
+	/** True while a register/reindex run is in flight. */
+	get isIndexing(): boolean {
+		return this.indexingOp !== null;
 	}
 
 	private async doEnsureVaultIndexed(): Promise<ReindexResult> {
@@ -161,15 +236,15 @@ export class QmdService {
 			// a prior embed could have failed or been interrupted, leaving search
 			// broken with no obvious recovery via this command. Re-embed to heal
 			// it; `qmd embed` is a cheap no-op when nothing is pending.
-			await this.embedVault();
-			return { registered: false, counts: null, embedded: true };
+			const busy = await this.embedVault();
+			return { registered: false, counts: null, embedded: !busy, embedBusy: busy };
 		}
 		const add = await this.cli.addCollection(this.vaultPath!, this.config.vaultCollection);
 		if (add.code !== 0) {
 			throw new Error(`qmd collection add failed: ${(add.stderr || add.stdout).trim()}`);
 		}
-		await this.embedVault();
-		return { registered: true, counts: null, embedded: true };
+		const busy = await this.embedVault();
+		return { registered: true, counts: null, embedded: !busy, embedBusy: busy };
 	}
 
 	private async doReindexVault(): Promise<ReindexResult> {
@@ -182,20 +257,23 @@ export class QmdService {
 			throw new Error(`qmd update failed: ${(update.stderr || update.stdout).trim()}`);
 		}
 		const counts = parseUpdateOutput(update.stdout)[this.config.vaultCollection] ?? null;
-		// Embed when the vault changed — or when the output couldn't be parsed
-		// (format drift): embedding is a cheap no-op if nothing is pending.
-		const needsEmbed = counts === null || hasChanges(counts);
-		if (needsEmbed) {
-			await this.embedVault();
-		}
-		return { registered: false, counts, embedded: needsEmbed };
+		// Embed when the vault changed, when the output couldn't be parsed (format
+		// drift), or when the last embed was skipped by qmd's lock: embedding is a
+		// cheap no-op if nothing is pending.
+		const needsEmbed = counts === null || hasChanges(counts) || this.embedPending;
+		const busy = needsEmbed ? await this.embedVault() : false;
+		return { registered: false, counts, embedded: needsEmbed && !busy, embedBusy: busy };
 	}
 
-	private async embedVault(): Promise<void> {
+	/** Embed the vault collection; resolves true when qmd's embed lock was busy (nothing embedded). */
+	private async embedVault(): Promise<boolean> {
+		this.runListener.onPhase?.("embedding");
 		const embed = await this.cli.embed(this.config.vaultCollection);
 		if (embed.code !== 0) {
 			throw new Error(`qmd embed failed: ${(embed.stderr || embed.stdout).trim()}`);
 		}
+		this.embedPending = isEmbedLockBusy(`${embed.stdout}\n${embed.stderr}`);
+		return this.embedPending;
 	}
 
 	/** Run a search, scoped to the configured (or per-call overridden) collections. */

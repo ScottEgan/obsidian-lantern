@@ -42,6 +42,25 @@ jobs:
       - name: Run tests
         run: npm test
 
+  windows-qmd:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The full suite still has POSIX-only path expectations; this is focused
+      # launcher coverage, not a claim of full-suite Windows compatibility.
+      - name: Test Windows qmd launches
+        run: npx vitest run tests/qmd/shell.test.ts tests/qmd/QmdClient.test.ts
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -66,7 +85,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [lint, test, build]
+    needs: [lint, test, build, windows-qmd]
     runs-on: ubuntu-latest
     permissions:
       contents: write

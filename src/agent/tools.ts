@@ -12,7 +12,7 @@ import { App, TFile } from "obsidian";
 import { readFile } from "fs/promises";
 import { existsSync } from "fs";
 import type { QmdService } from "../qmd/QmdService";
-import type { QmdSearchMode, QmdResult } from "../qmd/QmdClient";
+import type { QmdDocument, QmdSearchMode, QmdResult } from "../qmd/QmdClient";
 import { resolveVaultPaths, resolveNotePathLoose } from "../qmd/vaultPath";
 import { readCollectionRoots, resolveWithinRoot } from "../qmd/qmdConfig";
 import { noteTags, tagMatches, scopeCandidates, scopedFetchLimit, parseWhere } from "../search/scope";
@@ -63,6 +63,8 @@ export interface ReferenceToolOptions {
 	readFile?: (absPath: string) => Promise<string>;
 	/** True if the collection root still exists on disk (default: fs existsSync). */
 	rootExists?: (root: string) => boolean;
+	/** Indexed-copy read when the disk read fails (default: qmd MCP `get`). */
+	getDocument?: (collection: string, path: string) => Promise<QmdDocument>;
 }
 
 export interface ToolOptions {
@@ -584,45 +586,79 @@ function buildReferenceTools(
 				if (!refs.configured.includes(collection)) {
 					return `Error: "${collection}" is not a configured reference collection (${refs.configured.join(", ")}).`;
 				}
-				const roots = (refs.getRoots ?? readCollectionRoots)();
-				const root = roots[collection];
-				if (!root) {
-					return `Error: the root folder of "${collection}" is unknown (not in qmd's index.yml).`;
-				}
-				// Untrusted (LLM-authored) path — refuse anything escaping the root.
-				const abs = resolveWithinRoot(root, path);
-				if (!abs) return "Error: path may not contain '..' or escape the collection root.";
-				let content: string;
-				try {
-					content = await (refs.readFile ?? ((p: string) => readFile(p, "utf-8")))(abs);
-				} catch {
-					// qmd's index can outlive the files on disk: a moved collection root
-					// or a pruned git worktree still answers search_references from the
-					// cached snapshot, but reads fail. Name that case instead of blaming
-					// the path — the path is usually correct, and telling the model to
-					// re-check it just sends it looping over a good path forever.
-					if (!(refs.rootExists ?? existsSync)(root)) {
-						return (
-							`Error: the root folder of "${collection}" no longer exists on disk (${root}). ` +
-							"qmd still returns search hits from its cached index, but the files are gone — " +
-							"the collection must be re-registered against its current path and re-embedded. " +
-							"Tell the user; do not retry the path."
-						);
-					}
-					return (
-						`Error: "${collection}/${path}" isn't readable on disk — the path may be off, or the index stale. ` +
-						"Re-check the exact path against search_references; if it matches, the collection needs re-indexing."
-					);
-				}
+				const traversal = "Error: path may not contain '..' or escape the collection root.";
+				if (path.replace(/\\/g, "/").split("/").includes("..")) return traversal;
 				const fromLine = asPositiveInt(args.from_line);
 				const lineCount = asPositiveInt(args.line_count);
-				return formatFile(
-					`${collection}/${path}`,
-					content,
-					fromLine,
-					lineCount,
-					opts.maxReadBytes,
-					referenceLink(collection, path)
+
+				// Disk first: the current file. Untrusted (LLM-authored) path — refuse
+				// anything escaping the root.
+				const root = (refs.getRoots ?? readCollectionRoots)()[collection];
+				if (root) {
+					const abs = resolveWithinRoot(root, path);
+					if (!abs) return traversal;
+					try {
+						const content = await (refs.readFile ?? ((p: string) => readFile(p, "utf-8")))(abs);
+						return formatFile(
+							`${collection}/${path}`,
+							content,
+							fromLine,
+							lineCount,
+							opts.maxReadBytes,
+							referenceLink(collection, path)
+						);
+					} catch {
+						// fall through to qmd's indexed copy
+					}
+				}
+
+				// qmd's index keeps a snapshot of every file, so search_references can
+				// hit docs whose collection root moved (a pruned git worktree, a renamed
+				// folder) or that index.yml doesn't list. Read that same snapshot via
+				// qmd's MCP `get` so reads are as resilient as search.
+				let doc: QmdDocument | null = null;
+				try {
+					doc = await (refs.getDocument ?? ((c: string, p: string) => qmd.getDocument(c, p)))(collection, path);
+				} catch {
+					doc = null;
+				}
+				const rootGone = root !== undefined && !(refs.rootExists ?? existsSync)(root);
+				if (doc?.ok && doc.collection === collection) {
+					const why = !root
+						? "its root folder isn't in qmd's index.yml"
+						: rootGone
+							? `its root folder no longer exists on disk (${root}) — the collection must be re-registered against its current path; tell the user`
+							: "the file isn't readable on disk";
+					return (
+						`Note: read from qmd's indexed copy — ${why}. Content is as of the last qmd update.\n` +
+						formatFile(
+							`${collection}/${doc.path}`,
+							doc.text,
+							fromLine,
+							lineCount,
+							opts.maxReadBytes,
+							referenceLink(collection, doc.path)
+						)
+					);
+				}
+
+				const suggestions =
+					doc && !doc.ok && doc.suggestions.length > 0
+						? ` qmd suggests: ${doc.suggestions.slice(0, 5).join(", ")}.`
+						: "";
+				if (!root) {
+					return `Error: the root folder of "${collection}" is unknown (not in qmd's index.yml), and qmd's index has no "${collection}/${path}".${suggestions}`;
+				}
+				if (rootGone) {
+					return (
+						`Error: the root folder of "${collection}" no longer exists on disk (${root}), and qmd's indexed copy couldn't be read. ` +
+						"The collection must be re-registered against its current path and re-embedded. " +
+						"Tell the user; do not retry the path."
+					);
+				}
+				return (
+					`Error: "${collection}/${path}" isn't readable on disk or in qmd's index — the path may be off.${suggestions} ` +
+					"Re-check the exact path against search_references; if it matches, the collection needs re-indexing."
 				);
 			},
 		},

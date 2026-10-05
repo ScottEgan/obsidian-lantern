@@ -1,7 +1,7 @@
 {
 	"id": "lantern",
 	"name": "Lantern",
-	"version": "1.7.1",
+	"version": "1.8.1",
 	"minAppVersion": "1.7.2",
 	"description": "Local semantic search and a grounded, cited chat agent for your vault — powered by a locally-installed qmd. Requires the qmd CLI.",
 	"author": "Bartosz Porzezinski",

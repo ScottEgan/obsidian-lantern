@@ -1232,7 +1232,7 @@ export class LanternView extends ItemView {
 
 		const texts: Record<string, string> = {
 			"no-binary":
-				"qmd was not found. Install qmd — it needs a build newer than v2.5.3 — and set its full path in settings (see the setup guide).",
+				"qmd was not found. Install qmd 2.8.3+ (npm install -g @tobilu/qmd) and set its full path in settings (see the setup guide).",
 			"no-daemon": "The qmd daemon isn't running.",
 			unregistered: "This vault isn't registered with qmd yet — register it to index and embed your notes.",
 			"no-llm-url": "Chat needs a local LLM. Set the LLM base URL in settings (e.g. http://localhost:8080/v1).",

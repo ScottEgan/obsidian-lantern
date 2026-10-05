@@ -9,12 +9,21 @@
  * a plain REST endpoint that needs no MCP/JSON-RPC handshake:
  *   GET  /health                          -> { status: "ok", uptime }
  *   POST /query  (alias /search)          -> { results: RawQmdResult[] }
+ *   POST /mcp    (tools/call `get`)       -> one document from the index
  * The daemon keeps the models resident, so queries after the first are warm.
+ * MCP over HTTP is stateless since qmd 2.8 (protocol 2026-07-28): one POST per
+ * call, no initialize handshake or session id.
+ *
+ * qmd ≥2.8.3 answers 403 to any request whose `Origin` header names a
+ * non-loopback host (DNS-rebinding guard). `requestUrl` runs in Electron's
+ * main process via `net.request` without an origin, so no Origin is sent —
+ * never switch these calls to renderer `fetch`, which would send
+ * `Origin: app://obsidian.md` and be refused.
  */
 
 import { requestUrl } from "obsidian";
 import { spawn } from "./shell";
-import { commandEnv, resolveCommand } from "./processEnv";
+import { commandCwd, commandEnv, resolveCommand } from "./processEnv";
 import { truncate, decodeUriSafe } from "../util";
 
 export type QmdSearchType = "lex" | "vec" | "hyde";
@@ -113,6 +122,70 @@ export interface QmdResult {
 	context: string | null;
 }
 
+/** One document read from qmd's index (MCP `get`). */
+export type QmdDocument =
+	| { ok: true; collection: string; path: string; text: string }
+	| { ok: false; error: string; suggestions: string[] };
+
+/** MCP protocol revision qmd's stateless HTTP transport speaks. */
+export const MCP_PROTOCOL_VERSION = "2026-07-28";
+
+/** JSON-RPC body for an MCP `tools/call get` of the full document body. */
+export function buildGetBody(file: string): Record<string, unknown> {
+	return {
+		jsonrpc: "2.0",
+		id: 1,
+		method: "tools/call",
+		params: {
+			name: "get",
+			arguments: { file, lineNumbers: false },
+			_meta: {
+				"io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+				"io.modelcontextprotocol/clientCapabilities": {},
+			},
+		},
+	};
+}
+
+interface DaemonLaunch {
+	/** A launcher can emit error after spawn on Windows. */
+	error?: Error;
+}
+
+interface McpGetResponse {
+	result?: {
+		isError?: boolean;
+		content?: Array<{ type?: string; text?: string; resource?: { uri?: string; text?: string } }>;
+	};
+	error?: { message?: string };
+}
+
+/**
+ * Map an MCP `get` response to a QmdDocument. qmd prepends a
+ * `<!-- Context: … -->` comment when the path has a context; it's dropped so
+ * line numbers match the indexed body (and qmd's search-hit `line` values).
+ */
+export function parseGetResponse(body: McpGetResponse | undefined): QmdDocument {
+	if (!body) return { ok: false, error: "empty response", suggestions: [] };
+	if (body.error) return { ok: false, error: body.error.message ?? "MCP error", suggestions: [] };
+	const content = body.result?.content ?? [];
+	const resource = content.find((c) => c.type === "resource")?.resource;
+	if (!body.result?.isError && resource && typeof resource.text === "string") {
+		const { collection, path } = mapResult({ file: resource.uri ?? "" } as RawQmdResult);
+		const text = resource.text.replace(/^<!-- Context: [\s\S]*? -->\n\n/, "");
+		return { ok: true, collection, path, text };
+	}
+	const message = content.map((c) => c.text ?? "").join("\n").trim();
+	// "Document not found: x\n\nDid you mean one of these?\n  - a\n  - b"
+	const [head, ...rest] = message.split(/\n\s*\nDid you mean one of these\?\n/);
+	const suggestions = rest
+		.join("\n")
+		.split("\n")
+		.map((l) => l.replace(/^\s*-\s*/, "").trim())
+		.filter(Boolean);
+	return { ok: false, error: head.trim() || "document not found", suggestions };
+}
+
 // qmd's server does listen(port, "localhost"), which on macOS binds IPv6 ::1
 // only. Use the same hostname so the client resolves to the same address
 // (connecting to 127.0.0.1 would be refused).
@@ -181,10 +254,9 @@ export function buildQueryBody(
 /**
  * Split a qmd `file` field into collection + path.
  *
- * Newer qmd (literal-path storage) returns a qmd:// URI with a percent-encoded
- * real path, e.g. `qmd://coll/Job%20Hunt%202025/Note.md`; older qmd (≤2.5.3)
- * returned a bare slug `coll/job-hunt-2025/note.md`. Handle both: strip the
- * scheme and URL-decode each part. `/` separators are not encoded by qmd.
+ * qmd returns a qmd:// URI with a percent-encoded real path, e.g.
+ * `qmd://coll/Job%20Hunt%202025/Note.md`: strip the scheme and URL-decode each
+ * part (`/` separators are not encoded). A bare `coll/path` is accepted too.
  */
 export function mapResult(raw: RawQmdResult): QmdResult {
 	const file = (raw.file ?? "").replace(/^qmd:\/\//, "");
@@ -267,13 +339,15 @@ export class QmdClient {
 	}
 
 	private async startAndPoll(timeoutMs: number): Promise<void> {
-		await this.spawnDaemon();
+		const launch = await this.spawnDaemon();
 
 		const start = Date.now();
 		while (Date.now() - start < timeoutMs) {
 			if (await this.isRunning()) return;
+			if (launch.error) throw launch.error;
 			await delay(500);
 		}
+		if (launch.error) throw launch.error;
 		throw new Error(
 			`qmd daemon did not become healthy on port ${this.config.port} within ${timeoutMs}ms`
 		);
@@ -323,33 +397,75 @@ export class QmdClient {
 		return results.map(mapResult);
 	}
 
+	/**
+	 * Read one document's body from qmd's index via the MCP `get` tool —
+	 * `file` is a decoded `collection/path`. The index keeps a snapshot of every
+	 * file, so this answers even when the file has moved or its collection root
+	 * is gone. Never pass an empty path: qmd resolves `""` to an arbitrary doc.
+	 */
+	async getDocument(file: string): Promise<QmdDocument> {
+		if (!file.trim() || !file.includes("/")) {
+			return { ok: false, error: "expected collection/path", suggestions: [] };
+		}
+		let res;
+		try {
+			res = await requestUrl({
+				url: `${this.baseUrl()}/mcp`,
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Accept: "application/json, text/event-stream",
+					"Mcp-Method": "tools/call",
+					"Mcp-Name": "get",
+				},
+				body: JSON.stringify(buildGetBody(file)),
+				throw: false,
+			});
+		} catch (error) {
+			return {
+				ok: false,
+				error: `qmd daemon not reachable at ${this.baseUrl()} (${error instanceof Error ? error.message : String(error)})`,
+				suggestions: [],
+			};
+		}
+		let body: McpGetResponse | undefined;
+		try {
+			body = res.json as McpGetResponse | undefined;
+		} catch {
+			body = undefined;
+		}
+		if (res.status !== 200 && !body?.error) {
+			return { ok: false, error: `qmd get failed (HTTP ${res.status}): ${truncate(res.text ?? "", 200)}`, suggestions: [] };
+		}
+		return parseGetResponse(body);
+	}
+
 	/** Start the qmd HTTP daemon as a detached process. */
-	private spawnDaemon(): Promise<void> {
+	private spawnDaemon(): Promise<DaemonLaunch> {
 		return new Promise((resolve, reject) => {
-			let settled = false;
+			let spawned = false;
+			const launch: DaemonLaunch = {};
 			const args = ["mcp", "--http", "--port", String(this.config.port), "--daemon"];
 
 			const child = spawn(resolveCommand(this.config.binaryPath), args, {
 				detached: true,
 				stdio: "ignore",
 				env: commandEnv(),
+				cwd: commandCwd(),
 			});
 
-			child.once("error", (err: Error) => {
-				if (settled) return;
-				settled = true;
-				reject(
-					new Error(
-						`Failed to start qmd daemon ("${this.config.binaryPath} ${args.join(" ")}"): ${err.message}`
-					)
+			child.on("error", (err: Error) => {
+				launch.error ??= new Error(
+					`Failed to start qmd daemon ("${this.config.binaryPath} ${args.join(" ")}"): ${err.message}`
 				);
+				if (!spawned) reject(launch.error);
 			});
 
 			child.once("spawn", () => {
+				if (launch.error) return;
+				spawned = true;
 				child.unref();
-				if (settled) return;
-				settled = true;
-				resolve();
+				resolve(launch);
 			});
 		});
 	}

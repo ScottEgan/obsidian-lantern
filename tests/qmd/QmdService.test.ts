@@ -328,3 +328,83 @@ describe("QmdService.setVaultContext", () => {
 		await expect(service.setVaultContext("")).resolves.toBeUndefined();
 	});
 });
+
+describe("QmdService embed lock (qmd ≥2.8)", () => {
+	const busy: QmdExecResult = { code: 0, stdout: "Another embed process is already running. Skipping.\n", stderr: "" };
+
+	it("reports embedBusy instead of claiming the vault was embedded", async () => {
+		const deps = makeMocks();
+		vi.mocked(deps.cli.embed).mockResolvedValue(busy);
+		const { service } = makeService({}, deps);
+		const result = await service.reindexVault();
+		expect(result).toMatchObject({ embedded: false, embedBusy: true });
+		expect(result.counts?.added).toBe(1);
+	});
+
+	it("reports embedBusy on first registration too", async () => {
+		const deps = makeMocks();
+		vi.mocked(deps.cli.hasCollection).mockResolvedValue(false);
+		vi.mocked(deps.cli.embed).mockResolvedValue(busy);
+		const { service } = makeService({}, deps);
+		expect(await service.ensureVaultIndexed()).toMatchObject({ registered: true, embedded: false, embedBusy: true });
+	});
+});
+
+describe("QmdService.getVersion", () => {
+	it("flags a qmd older than the minimum", async () => {
+		const { service } = makeService(); // mock reports qmd 2.5.3
+		expect(await service.getVersion()).toEqual({ version: "2.5.3", minimum: "2.8.3", supported: false });
+	});
+
+	it("accepts the minimum and treats an unparseable version as supported", async () => {
+		const deps = makeMocks();
+		vi.mocked(deps.cli.version).mockResolvedValue({ ...ok, stdout: "qmd 2.8.3 (abc1234)" });
+		expect((await makeService({}, deps).service.getVersion()).supported).toBe(true);
+		vi.mocked(deps.cli.version).mockResolvedValue({ ...ok, stdout: "dev build" });
+		expect(await makeService({}, deps).service.getVersion()).toMatchObject({ version: null, supported: true });
+	});
+});
+
+describe("QmdService run listener + skipped-embed retry", () => {
+	const busy: QmdExecResult = { code: 0, stdout: "Another embed process is already running. Skipping.\n", stderr: "" };
+
+	it("reports start, the embed phase, and the result", async () => {
+		const deps = makeMocks();
+		const { service } = makeService({}, deps);
+		const events: string[] = [];
+		service.setRunListener({
+			onStart: () => events.push("start"),
+			onPhase: (p) => events.push(p),
+			onDone: (r) => events.push(`done:${r.embedded}`),
+		});
+		await service.reindexVault();
+		expect(events).toEqual(["start", "embedding", "done:true"]);
+		expect(service.isIndexing).toBe(false);
+	});
+
+	it("reports errors to the listener and still rejects", async () => {
+		const deps = makeMocks();
+		vi.mocked(deps.cli.update).mockResolvedValue({ code: 1, stdout: "", stderr: "boom" });
+		const { service } = makeService({}, deps);
+		const onError = vi.fn();
+		service.setRunListener({ onError });
+		await expect(service.reindexVault()).rejects.toThrow(/boom/);
+		expect(onError).toHaveBeenCalledOnce();
+	});
+
+	it("re-embeds on the next update after a lock-skipped embed, even with no text changes", async () => {
+		const deps = makeMocks();
+		vi.mocked(deps.cli.embed).mockResolvedValueOnce(busy);
+		const { service } = makeService({}, deps);
+		expect((await service.reindexVault()).embedBusy).toBe(true);
+
+		vi.mocked(deps.cli.update).mockResolvedValue({ ...ok, stdout: UPDATE_UNCHANGED });
+		const second = await service.reindexVault();
+		expect(deps.cli.embed).toHaveBeenCalledTimes(2);
+		expect(second).toMatchObject({ embedded: true, embedBusy: false });
+
+		// Once the embed went through, an unchanged vault skips it again.
+		await service.reindexVault();
+		expect(deps.cli.embed).toHaveBeenCalledTimes(2);
+	});
+});

@@ -2,7 +2,7 @@
  * Read collection roots from qmd's YAML config (read-only).
  *
  * `qmd collection list` does not print filesystem roots; they live in
- * ~/.config/qmd/index.yml (XDG_CONFIG_HOME respected) as
+ * ~/.config/qmd/index.yml (QMD_CONFIG_DIR / XDG_CONFIG_HOME respected) as
  * `collections.<name>.path`. We need them only to open results from non-vault
  * collections, so a tiny targeted parser beats a YAML dependency (the plugin
  * has none): collection names are two-space-indented `name:` keys under
@@ -11,10 +11,13 @@
 
 import { readFileSync } from "fs";
 import { homedir } from "os";
-import { join, resolve, sep } from "path";
+import { dirname, join, resolve, sep } from "path";
 
 /** Path of qmd's YAML config file. */
 export function qmdConfigPath(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+	// qmd's own precedence (collections.ts getConfigDir): QMD_CONFIG_DIR, then
+	// XDG_CONFIG_HOME/qmd, then ~/.config/qmd.
+	if (env.QMD_CONFIG_DIR && env.QMD_CONFIG_DIR.length > 0) return join(env.QMD_CONFIG_DIR, "index.yml");
 	const configHome = env.XDG_CONFIG_HOME && env.XDG_CONFIG_HOME.length > 0
 		? env.XDG_CONFIG_HOME
 		: join(home, ".config");
@@ -94,4 +97,45 @@ export function resolveWithinRoot(root: string, relPath: string): string | null 
 	const abs = resolve(rootAbs, clean);
 	if (abs !== rootAbs && !abs.startsWith(rootAbs + sep)) return null;
 	return abs;
+}
+
+/**
+ * qmd's embed lock file (qmd ≥2.8): `.qmd-embed.lock` next to the index DB,
+ * holding the PID of the running `qmd embed`. Mirrors qmd's getDefaultDbPath:
+ * INDEX_PATH, else `$XDG_CACHE_HOME/qmd/index.sqlite`, else `~/.cache/qmd/index.sqlite`.
+ */
+export function qmdEmbedLockPath(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+	if (env.INDEX_PATH && env.INDEX_PATH.length > 0) return join(dirname(env.INDEX_PATH), ".qmd-embed.lock");
+	const cacheHome = env.XDG_CACHE_HOME && env.XDG_CACHE_HOME.length > 0 ? env.XDG_CACHE_HOME : join(home, ".cache");
+	return join(cacheHome, "qmd", ".qmd-embed.lock");
+}
+
+/**
+ * PID holding qmd's embed lock, or null when the lock is absent, unreadable,
+ * or stale (its process is gone — qmd recovers those on the next embed).
+ * `isAlive` is injectable for tests (default: signal 0).
+ */
+export function embedLockHolder(
+	lockPath: string = qmdEmbedLockPath(),
+	read: (path: string) => string = (p) => readFileSync(p, "utf-8"),
+	isAlive: (pid: number) => boolean = processAlive
+): number | null {
+	let pid: number;
+	try {
+		pid = parseInt(read(lockPath).trim(), 10);
+	} catch {
+		return null;
+	}
+	if (!Number.isInteger(pid) || pid <= 0) return null;
+	return isAlive(pid) ? pid : null;
+}
+
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// EPERM = exists but owned by another user; still alive.
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
 }

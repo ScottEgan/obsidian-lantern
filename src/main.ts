@@ -15,9 +15,10 @@ import {
 	FileSystemAdapter,
 	normalizePath,
 	debounce,
+	setIcon,
+	setTooltip,
 	type Debouncer,
 	type Editor,
-	type EventRef,
 } from "obsidian";
 import { LanternView, VIEW_TYPE_LANTERN } from "./ui/SearchView";
 import { LanternSettingTab } from "./ui/SettingsTab";
@@ -29,7 +30,7 @@ import {
 	toLlmConfig,
 	type LanternSettings,
 } from "./settings";
-import { QmdService, type QmdSearchOptions, type ReindexResult } from "./qmd/QmdService";
+import { QmdService, type QmdSearchOptions, type QmdVersionInfo, type ReindexResult } from "./qmd/QmdService";
 import type { QmdResult } from "./qmd/QmdClient";
 import { LlmClient, type ChatMessage, type ModelLoadState } from "./agent/LlmClient";
 import { AgentLoop, type AgentEvent, type AgentRunResult } from "./agent/AgentLoop";
@@ -39,6 +40,8 @@ import { searchWeb } from "./agent/webSearch";
 import { resolvePrompt, missingRequiredPrompts, PROMPT_DEFS } from "./agent/promptRegistry";
 import { registerLanternIcon, LANTERN_ICON } from "./ui/lanternIcon";
 import { errorMessage } from "./util";
+import { IndexTracker, describeIndexStatus } from "./qmd/indexStatus";
+import { embedLockHolder } from "./qmd/qmdConfig";
 
 /**
  * Debounce window for auto re-indexing after file changes. `qmd update` is
@@ -61,7 +64,13 @@ export default class LanternPlugin extends Plugin {
 	private warnedMissingPromptNote = false;
 
 	private autoUpdate: Debouncer<[], Promise<void>> | null = null;
-	private fileEventRefs: EventRef[] = [];
+	/** Auto-update already told the user an embed was skipped (cleared once one isn't). */
+	private embedBusyNotified = false;
+	/** Vault index freshness (status bar + settings overview). */
+	indexTracker!: IndexTracker;
+	private statusBarEl: HTMLElement | null = null;
+	/** Last rendered status-bar state, so the 1 s tick only touches the DOM on change. */
+	private statusBarKey = "";
 
 	async onload(): Promise<void> {
 		registerLanternIcon(); // custom tab/ribbon icon (Lucide has no lantern)
@@ -74,6 +83,17 @@ export default class LanternPlugin extends Plugin {
 		}
 
 		this.qmd = new QmdService(toServiceConfig(this.settings));
+		this.indexTracker = new IndexTracker(this.settings.lastIndexedAt);
+		this.qmd.setRunListener({
+			onStart: () => this.indexTracker.beginRun(Date.now()),
+			onPhase: (phase) => this.indexTracker.setPhase(phase, Date.now()),
+			onDone: (result) => {
+				this.indexTracker.finishRun(result);
+				this.settings.lastIndexedAt = this.indexTracker.status.lastIndexedAt;
+				void this.saveData(this.settings); // state only — no applySettings()
+			},
+			onError: (error) => this.indexTracker.failRun(errorMessage(error)),
+		});
 		const vaultPath = this.getVaultPath();
 		if (vaultPath) {
 			this.qmd.setVaultPath(vaultPath);
@@ -185,11 +205,14 @@ export default class LanternPlugin extends Plugin {
 
 		this.autoUpdate = debounce(() => this.runAutoUpdate(), AUTO_UPDATE_DEBOUNCE_MS, true);
 
+		this.setupIndexStatus();
+
 		this.app.workspace.onLayoutReady(() => {
 			// File events MUST be registered after layout-ready: Obsidian fires
 			// `create` for every existing file during vault load, which used to
 			// trigger a full reindex on every app start.
-			this.syncFileEvents();
+			this.registerFileEvents();
+			this.markOfflineChanges();
 
 			// Best-effort: get the daemon warming in the background. Once it settles,
 			// re-probe open setup cards — the first probe at view-open can race a cold
@@ -200,7 +223,32 @@ export default class LanternPlugin extends Plugin {
 					console.warn("[Lantern] qmd daemon not available on startup:", error);
 				})
 				.finally(() => this.refreshSetupCards());
+			void this.warnIfQmdOutdated();
 		});
+	}
+
+	/** One notice per load when the installed qmd is older than Lantern supports. */
+	private async warnIfQmdOutdated(): Promise<void> {
+		try {
+			const info = await this.qmd.getVersion();
+			if (info.supported) return;
+			new Notice(
+				`Lantern: qmd ${info.version} is older than ${info.minimum}. Result paths come back ` +
+				"slugified and may not open. Update with: npm install -g @tobilu/qmd",
+				15000
+			);
+		} catch {
+			// Binary missing — the setup card covers that.
+		}
+	}
+
+	/** Installed qmd version vs the supported minimum (settings overview). */
+	async getQmdVersion(): Promise<QmdVersionInfo | null> {
+		try {
+			return await this.qmd.getVersion();
+		} catch {
+			return null;
+		}
 	}
 
 	onunload(): void {
@@ -320,7 +368,8 @@ export default class LanternPlugin extends Plugin {
 		if (vaultPath) this.qmd.setVaultPath(vaultPath);
 		this.llm.updateConfig(toLlmConfig(this.settings));
 		this.agent = this.buildAgent();
-		this.syncFileEvents();
+		this.syncAutoUpdate();
+		this.renderIndexStatus(); // show/hide per showIndexStatus
 		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_LANTERN)) {
 			if (leaf.view instanceof LanternView) leaf.view.onSettingsChanged();
 		}
@@ -333,32 +382,124 @@ export default class LanternPlugin extends Plugin {
 	}
 
 	/**
-	 * Keep vault file-event registration in sync with the auto-update setting
-	 * (no plugin reload needed). Only effective after layout-ready — see onload.
+	 * Vault file events feed the index tracker (always) and auto-update (when
+	 * enabled — the setting is read per event, so toggling needs no reload).
+	 * Only called after layout-ready — see onload.
 	 */
-	private syncFileEvents(): void {
-		const wantEvents = this.settings.autoUpdateOnChange && this.app.workspace.layoutReady;
-		if (wantEvents && this.fileEventRefs.length === 0) {
-			const onChange = (file: TAbstractFile) => {
-				if (file.path.endsWith(".md")) this.autoUpdate?.();
-			};
-			this.fileEventRefs = [
-				this.app.vault.on("modify", onChange),
-				this.app.vault.on("create", onChange),
-				this.app.vault.on("delete", onChange),
-				this.app.vault.on("rename", onChange),
-			];
-			for (const ref of this.fileEventRefs) this.registerEvent(ref);
-		} else if (!this.settings.autoUpdateOnChange && this.fileEventRefs.length > 0) {
-			for (const ref of this.fileEventRefs) this.app.vault.offref(ref);
-			this.fileEventRefs = [];
+	private registerFileEvents(): void {
+		const onChange = (file: TAbstractFile) => {
+			if (!file.path.endsWith(".md")) return;
+			this.indexTracker.markChanged(file.path);
+			this.scheduleAutoUpdate();
+		};
+		this.registerEvent(this.app.vault.on("modify", onChange));
+		this.registerEvent(this.app.vault.on("create", onChange));
+		this.registerEvent(this.app.vault.on("delete", onChange));
+		this.registerEvent(this.app.vault.on("rename", onChange));
+	}
+
+	/** Arm the debounced auto-update (no-op when the setting is off). */
+	private scheduleAutoUpdate(): void {
+		if (!this.settings.autoUpdateOnChange) return;
+		this.autoUpdate?.();
+		this.indexTracker.setScheduled(Date.now() + AUTO_UPDATE_DEBOUNCE_MS);
+	}
+
+	/** Disarm a pending auto-update when the setting is switched off. */
+	private syncAutoUpdate(): void {
+		if (this.settings.autoUpdateOnChange) return;
+		this.autoUpdate?.cancel();
+		this.indexTracker.setScheduled(null);
+	}
+
+	/**
+	 * Notes modified while Obsidian was closed (sync, git pull, other editors)
+	 * — mtime newer than the last index run. Skipped until one run has been
+	 * recorded, since there is nothing to compare against.
+	 */
+	private markOfflineChanges(): void {
+		const since = this.settings.lastIndexedAt;
+		if (since <= 0) return;
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			if (file.stat.mtime > since) this.indexTracker.markChanged(file.path);
 		}
+		if (this.indexTracker.status.dirty > 0) this.scheduleAutoUpdate();
+	}
+
+	/**
+	 * Status-bar item for the vault index (opt-in: showIndexStatus, off by
+	 * default — a ticking countdown can distract): shown only while something
+	 * is pending or running; click runs Update index. A 1 s tick drives the
+	 * countdown/elapsed text and, every third tick, checks qmd's embed lock
+	 * for an embed Lantern didn't start (kept while the item is off: the
+	 * settings overview reads the same tracker). Off = no DOM work at all.
+	 */
+	private setupIndexStatus(): void {
+		const el = this.addStatusBarItem();
+		el.addClass("lantern-index-status");
+		el.addEventListener("click", () => {
+			const view = describeIndexStatus(this.indexTracker.status, Date.now());
+			if (view.actionable) void this.updateIndex();
+		});
+		this.statusBarEl = el;
+		this.register(this.indexTracker.subscribe(() => this.renderIndexStatus()));
+		let tick = 0;
+		this.registerInterval(
+			window.setInterval(() => {
+				if (++tick % 3 === 0) {
+					const ownEmbed = this.indexTracker.status.phase === "embedding";
+					this.indexTracker.setExternalEmbed(!ownEmbed && embedLockHolder() !== null);
+				}
+				this.renderIndexStatus();
+			}, 1000)
+		);
+		this.renderIndexStatus();
+	}
+
+	private renderIndexStatus(): void {
+		const el = this.statusBarEl;
+		if (!el) return;
+		if (!this.settings.showIndexStatus) {
+			if (this.statusBarKey !== "off") {
+				this.statusBarKey = "off";
+				el.empty();
+				el.addClass("lantern-hidden");
+			}
+			return;
+		}
+		const view = describeIndexStatus(this.indexTracker.status, Date.now());
+		const key = `${view.level}|${view.short}|${view.detail}`;
+		if (key === this.statusBarKey) return;
+		this.statusBarKey = key;
+		el.empty();
+		el.toggleClass("lantern-hidden", view.short === "");
+		el.toggleClass("mod-clickable", view.actionable);
+		el.setAttr("data-level", view.level);
+		setTooltip(el, `Lantern — ${view.detail}`, { placement: "top" });
+		// The lantern stands in for a "Lantern:" label; its tint carries the level,
+		// and a spinner follows it while a run is in progress.
+		setIcon(el.createSpan({ cls: "lantern-index-status-icon" }), LANTERN_ICON);
+		if (view.level === "running") setIcon(el.createSpan({ cls: "lantern-index-status-spinner" }), "loader");
+		el.createSpan({ text: view.short });
 	}
 
 	private async runAutoUpdate(): Promise<void> {
+		this.indexTracker.setScheduled(null);
 		try {
-			await this.qmd.reindexVault();
+			const result = await this.qmd.reindexVault();
 			console.debug("[Lantern] Auto-update complete");
+			// Auto-update is otherwise silent, but a skipped embed leaves new notes
+			// without vectors. Say so once per busy stretch: the debounced update
+			// re-fires on every edit burst while another `qmd embed` holds the lock.
+			if (!result.embedBusy) {
+				this.embedBusyNotified = false;
+			} else if (!this.embedBusyNotified) {
+				this.embedBusyNotified = true;
+				new Notice(LanternPlugin.reindexMessage(result), 10000);
+			}
+			// Edits made during the run (or a run this call merely joined) are still
+			// dirty — queue another pass instead of leaving them unindexed.
+			if (this.indexTracker.status.dirty > 0) this.scheduleAutoUpdate();
 		} catch (error) {
 			console.error("[Lantern] Auto-update failed:", error);
 		}
@@ -419,6 +560,12 @@ export default class LanternPlugin extends Plugin {
 
 	/** Human-readable summary of a reindex outcome. */
 	private static reindexMessage(result: ReindexResult): string {
+		if (result.embedBusy) {
+			return (
+				`Lantern: ${result.registered ? "Vault registered and text-indexed" : "Text index updated"}; ` +
+				"embedding skipped — another qmd embed is running. Run Update index again once it finishes."
+			);
+		}
 		if (result.registered) return "Lantern: Vault registered and embedded.";
 		if (result.counts && !result.embedded) return "Lantern: Index already up to date.";
 		if (result.counts) {
@@ -481,8 +628,8 @@ export default class LanternPlugin extends Plugin {
 		try {
 			const result = await this.qmd.ensureVaultIndexed();
 			notice.setMessage(
-				result.registered
-					? "Lantern: Vault registered and embedded."
+				result.registered || result.embedBusy
+					? LanternPlugin.reindexMessage(result)
 					: "Lantern: Vault was already registered."
 			);
 			window.setTimeout(() => notice.hide(), 4000);
@@ -511,7 +658,9 @@ export default class LanternPlugin extends Plugin {
 		// startup even though the vault was indexed — so on error assume OK here
 		// (binary + daemon are up); the post-warm re-probe will correct if wrong.
 		try {
-			return (await this.qmd.isVaultIndexed()) ? "ok" : "unregistered";
+			const registered = await this.qmd.isVaultIndexed();
+			this.indexTracker.setRegistered(registered);
+			return registered ? "ok" : "unregistered";
 		} catch {
 			return "ok";
 		}

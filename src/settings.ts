@@ -26,6 +26,8 @@ export interface LanternSettings {
 	stopDaemonOnUnload: boolean;
 	/** Re-index the vault in qmd (debounced) when files change. */
 	autoUpdateOnChange: boolean;
+	/** Show the vault index status (changed notes, update/embed runs) in the status bar. */
+	showIndexStatus: boolean;
 
 	/** Default to hybrid (text + semantic) search; false = text-only. */
 	defaultSemantic: boolean;
@@ -119,6 +121,12 @@ export interface LanternSettings {
 	exaApiKey: string;
 	/** Web results requested per search_web call (1–20). */
 	webSearchMaxResults: number;
+	/**
+	 * Internal state, not a setting: start time (ms epoch) of the last completed
+	 * index run for this vault. Notes modified after it while Obsidian was closed
+	 * count as changed on the next start. 0 = unknown.
+	 */
+	lastIndexedAt: number;
 }
 
 export const DEFAULT_SETTINGS: LanternSettings = {
@@ -128,6 +136,7 @@ export const DEFAULT_SETTINGS: LanternSettings = {
 	autoStartDaemon: true,
 	stopDaemonOnUnload: false,
 	autoUpdateOnChange: false,
+	showIndexStatus: false,
 
 	defaultSemantic: true,
 	rerank: true,
@@ -183,6 +192,7 @@ export const DEFAULT_SETTINGS: LanternSettings = {
 	perplexityApiKey: "",
 	exaApiKey: "",
 	webSearchMaxResults: 5,
+	lastIndexedAt: 0,
 };
 
 /**

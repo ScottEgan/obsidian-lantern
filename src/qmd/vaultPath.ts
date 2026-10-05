@@ -1,10 +1,11 @@
 /**
  * Map qmd result paths back to real vault file paths.
  *
- * Newer qmd returns literal (percent-encoded) paths, which QmdClient decodes —
- * those hit the exact-match fast path. Results indexed by older qmd are slugs
- * (spaces and " - " became "-", special characters stripped), which fail exact
- * lookup; those are resolved by comparing a separator-insensitive signature of
+ * qmd ≥2.6 returns literal (percent-encoded) paths, which QmdClient decodes —
+ * those hit the exact-match fast path. Slugs (qmd ≤2.5.3, or an index not yet
+ * migrated by `qmd update`: spaces and " - " became "-", special characters
+ * stripped) and model-mangled paths fail exact lookup; those are resolved by
+ * comparing a separator-insensitive signature of
  * the slug against every vault markdown file's path — in ONE vault pass for a
  * whole batch of results, with per-path signatures memoized across calls
  * (signatures depend only on the path string, so the memo never goes stale;

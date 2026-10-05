@@ -12,17 +12,17 @@ A vault fills up fast, and a big one gets dark — you know something's in there
 
 Intentionally narrow. Lantern's job is to surface and cite the right notes fast — not to be a coding copilot, a writing assistant, or a general chatbot, and it won't grow into one. The chat agent retrieves and answers from what you've already written; web search is a bolt-on for outside context when the vault comes up short, nothing more.
 
-> **Reality check — read before installing.** Lantern is a thin front end over infrastructure you run yourself: qmd (built from source — see [Requirements](#requirements)) and, for chat, a local OpenAI-compatible LLM server. If you don't already run local models and a local search daemon, it won't work until you do.
+> **Reality check — read before installing.** Lantern is a thin front end over infrastructure you run yourself: qmd 2.8.3+ (see [Requirements](#requirements)) and, for chat, a local OpenAI-compatible LLM server. If you don't already run local models and a local search daemon, it won't work until you do.
 
 ## What it does
 
 - **Search pane** — hybrid (text + semantic), text-only (BM25), or vector-only modes; optional cross-encoder reranking and a Recent boost; saved searches; a **libraries** on/off toggle to also search external qmd collections (your vault is always searched). **Scope tokens** in the query box narrow results — `#tag` (repeatable, AND; nested tags match), `folder:Projects/`, `within:14d`, and `key=value` frontmatter (e.g. `status=active`) — and a scope-only query lists matching notes instantly. The box autocompletes `#tag`, `[[links]]`, and the scope tokens as you type. Results from other collections open in your system editor. The status bar reports how long each search took, next to the result count (`12 results · 1.4 s · in #project`). Clicking a note opens it in the current tab; middle-click or `Ctrl`/`Cmd`-click opens it in a new tab — the same on search results, scope listings, and note links in the chat trace.
 - **Chat pane** — ask a question and an agent searches (tag/folder/frontmatter/date-scoped when useful, with qmd's `"phrase"`/`-exclusion` syntax and hyde hypothetical-answer queries), reads your notes, lists your checkbox tasks, reads your daily notes, and **streams a grounded answer with footnote citations** (`[^1]` markers → a references section; vault notes as `[[wikilinks]]`, references/web as markdown links). Collapsible plain-language tool trace, live reasoning block, a **Stop** button, per-answer delete/retry/copy, prompt templates (⚡), and follow-up questions (history is compacted to fit local context windows). Optional persistent chat threads (off by default).
-- **Reference libraries for chat** — configure external qmd collections (a PMBOK guide, API docs, a project's docs…) and the agent consults them via `search_references`/`read_reference` for any relevant information your vault doesn't have, citing them alongside your `[[vault notes]]`. References use the same query craft and recall floor as the vault search. A library chip in the chat bar controls which references are available per conversation.
+- **Reference libraries for chat** — configure external qmd collections (a PMBOK guide, API docs, a project's docs…) and the agent consults them via `search_references`/`read_reference` for any relevant information your vault doesn't have, citing them alongside your `[[vault notes]]`. References use the same query craft and recall floor as the vault search. `read_reference` reads the file on disk and falls back to qmd's indexed copy (MCP `get`) when the file or its collection root has moved. A library chip in the chat bar controls which references are available per conversation.
 - **Optional write tools** (off by default): ask the agent to capture a note (inbox folder only) or append to a daily note — every write shows an **Apply/Deny card** before anything changes. Note/web content the agent reads is treated as untrusted (prompt-injection-aware).
 - **Optional web search** (off by default): when the vault can't answer, the agent can search the public web — via **Perplexity** (needs a key) or **Exa** (key optional; without one it uses Exa's free keyless endpoint) — and cite the sources. Search only: results are returned for the local model to read and cite; pages are never fetched. This is the **only** feature that sends anything off your machine.
 - **Editor integration:** select text → right-click → *Search selection* / *Ask about selection*; or *Ask about this note*.
-- **First-run setup card** that reports what's missing (qmd binary → daemon → vault registration), and a **status overview** in settings with one-click qmd and LLM reachability tests.
+- **First-run setup card** that reports what's missing (qmd binary → daemon → vault registration), a **status overview** in settings with one-click qmd and LLM reachability tests and live index status, and an optional status-bar item while the vault index is behind or busy.
 
 ## How it works
 
@@ -40,18 +40,14 @@ Obsidian  ──chat──────►  local LLM  ──tools──►  qmd 
 
 Lantern bundles no models or servers; you install and run all of these:
 
-- **qmd — built from source, newer than `v2.5.3`.** Through v2.5.3, qmd's CLI returned *slugified* filenames that Lantern's tools couldn't resolve back to real vault files (search results wouldn't open; the agent couldn't read notes it found). Upstream fixed it **after** 2.5.3. Use a qmd release **later than v2.5.3** if one exists; otherwise build current `main`:
+- **qmd 2.8.3 or newer.** Install from npm (Node ≥ 22) or Bun:
 
   ```bash
-  git clone https://github.com/tobi/qmd && cd qmd
-  npm install      # builds llama.cpp; needs Node ≥ 22 or Bun ≥ 1.0
-  npm run build
+  npm install -g @tobilu/qmd
   ```
 
-  Then point Lantern's **qmd binary path** at the built executable; `qmd --version` should report a version past 2.5.3.
-  - **macOS** is qmd's documented platform (needs SQLite with extension support: `brew install sqlite`). 
-  - **Linux** works wherever qmd runs. 
-  - **Windows** works to resolve qmd and the full path to qmd.cmd.
+  `qmd --version` should report 2.8.3 or later. Older releases (≤ 2.5.3) return slugified filenames that don't map back to vault files; Lantern shows a notice on startup and flags the version in the settings status overview.
+  - **macOS** is qmd's documented platform (needs SQLite with extension support: `brew install sqlite`). **Linux** works wherever qmd runs. **Windows** launcher compatibility supports a bare `qmd` command or a full path to `qmd.cmd` (including npm/pnpm shims); this does not imply upstream qmd officially supports Windows.
 - **A stronger embedding model.** qmd's default (EmbeddingGemma-300M) is fast but shallow. Tested with **Qwen3-Embedding-4B**: much slower indexing and more RAM, materially better recall. Set this in qmd, not Lantern.
 - **For chat (optional): a local OpenAI-compatible LLM server** — llama-server (run with `--jinja` for tool calling) or LM Studio. Without one, search works fully; only the chat pane is unavailable. A hosted OpenAI-compatible API also works (OpenAI: base URL `https://api.openai.com/v1` + an API key) — at the cost of sending note content to that provider.
 - **For web search (optional):** a [Perplexity API key](https://www.perplexity.ai/settings/api) (a Pro subscription is *not* API access — it includes a $5/month API credit, then pay-as-you-go), **or** [Exa](https://exa.ai) (API key optional — without one Lantern uses Exa's free, rate-limited keyless endpoint).
@@ -67,7 +63,7 @@ Lantern bundles no models or servers; you install and run all of these:
 
 ## Install
 
-Install [qmd](#requirements) first. A missing qmd, a qmd not on Obsidian's `PATH`, or qmd ≤ 2.5.3 is behind almost every "it doesn't work."
+Install [qmd](#requirements) first. A missing qmd, a qmd not on Obsidian's `PATH`, or a qmd older than 2.8.3 is behind almost every "it doesn't work."
 
 **From Community Plugins:** Settings → **Community plugins** → **Browse** → search **Lantern** → Install → Enable.
 
@@ -88,6 +84,7 @@ Install [qmd](#requirements) first. A missing qmd, a qmd not on Obsidian's `PATH
 - **Chat:** switch the pane to Chat, ask a question; the answer streams in with clickable footnote citations, and the send button becomes **Stop** while it runs. Tweak reasoning effort from the chat bar; delete/retry/copy any answer from its hover actions.
 - **Also search collections:** pick other qmd collections to search alongside your vault — the list icon next to the setting opens a checkable menu of qmd's collections (the choice is shown read-only); their results open in your system editor. In chat, the **library chip** toggles these per conversation.
 - **Keeping the index fresh:** run **Lantern: Update qmd index for this vault**, or enable *Auto-update on change* in settings (debounced 30 s). The qmd daemon picks up index changes automatically — no restart, so the models stay warm; the embed pass is skipped entirely when nothing changed.
+- **Index status:** enable *Show index status in the status bar* (off by default) and a status-bar item appears while the vault's index is behind or busy — `3 notes changed · update in 24s`, `qmd update · 4s`, `qmd embed · 1m 12s`, `embedding pending` (qmd's embed lock was held), `index update failed`, or `qmd embed running` when another process holds qmd's embed lock. Click it to run Update index. Changes made while Obsidian was closed count too (file modified after the last index run). It's hidden when the index is current; the settings status overview shows the same state either way. qmd reports pending embeddings only globally, so this tracks what Lantern saw: vault edits and its own update/embed runs.
 
 The first query after the daemon starts is a warm-up (models load, ~3–9 s); subsequent queries are faster.
 
@@ -110,6 +107,7 @@ The settings tab opens with a **status overview** (one-click qmd + LLM reachabil
 |---|---|
 | Vault collection name | qmd collection that mirrors this vault (auto-derived if empty) |
 | Auto-update on change | Re-index the vault in qmd after file changes (debounced 30 s; off by default) |
+| Show index status in the status bar | Status-bar item while the vault index is behind or busy (countdown, update/embed elapsed time); off by default |
 
 **Search**
 
@@ -162,7 +160,9 @@ The settings tab opens with a **status overview** (one-click qmd + LLM reachabil
 
 ## Troubleshooting
 
-- **Search results won't open, or the agent says it can't find a note it just found** — you're on qmd ≤ 2.5.3 (slugified filenames). Upgrade to qmd newer than 2.5.3 (see [Requirements](#requirements)).
+- **Search results won't open, or the agent says it can't find a note it just found** — your qmd is older than 2.8.3 (≤ 2.5.3 returns slugified filenames). Run `npm install -g @tobilu/qmd`, then `qmd update` so qmd re-stores the literal paths.
+- **"Embedding skipped — another qmd embed is running"** — qmd 2.8 serializes `qmd embed` with a process lock. The text index is current; run **Update qmd index** again after the other embed finishes. Auto-update on change shows this once per busy stretch.
+- **qmd answers 403 "Origin not allowed"** — qmd 2.8.3 refuses HTTP requests that carry a non-loopback `Origin` header (DNS-rebinding guard). Lantern sends none; a 403 means a proxy or another tool in front of the daemon adds one. `QMD_ALLOWED_ORIGINS` extends the allowlist.
 - **"qmd binary not found" / search does nothing** — set the **qmd binary path** to a *full* path; Obsidian's Electron process usually doesn't see your shell `PATH`. The settings status overview tests it.
 - **Daemon won't start** — start it yourself (`qmd mcp --http --daemon`) or enable auto-start; check the daemon port (default 8181) isn't already in use.
 - **Chat errors, or the LLM rejects the model** — pick a concrete model id in settings (router/multi-model servers reject placeholders), and run llama-server with `--jinja` for tool calling.
@@ -170,7 +170,7 @@ The settings tab opens with a **status overview** (one-click qmd + LLM reachabil
 - **Chat with an OpenAI reasoning model doesn't think** — not a bug: gpt-5.x rejects function tools in `/v1/chat/completions` unless `reasoning_effort` is `none` ("To use function tools, use /v1/responses or set reasoning_effort to 'none'"), and the agent always sends tools. Lantern sends `none`, so the reasoning-effort setting is inert on those models. Reasoning + tools together needs the Responses API, which Lantern doesn't speak.
 - **First query is slow** — the first query after the daemon starts loads qmd's models (~3–9 s); later queries are warm.
 - **Weak search results** — use a stronger embedding model in qmd (see Requirements), enable rerank, and/or lower the minimum relevance score for more recall.
-- **Windows** — working to fire qmd commands; but qmd doesn't officially support windows so expect rough edges.
+- **Windows** — Lantern handles npm/pnpm command shims, but upstream qmd's platform support is separate; expect rough edges. When launched through a Windows npm/pnpm shim, CR/LF runs in multi-line vault context are replaced with a space (both lines' text is kept). Direct executable launches and macOS/Linux preserve line breaks. Exact multi-line context on Windows would require a different launch route.
 
 ## Development
 
@@ -182,7 +182,7 @@ npm test           # run the unit tests
 npm run lint
 ```
 
-Lantern is a thin client: `src/qmd/` holds the qmd integration (`QmdClient` for the HTTP query/daemon, `QmdCli` for indexing commands, `QmdService` to orchestrate them), `src/agent/` holds the chat agent (`LlmClient`, `AgentLoop`, tools, prompts), and `src/ui/` is the Obsidian view + settings. There are no bundled runtime dependencies — queries use Obsidian's `requestUrl` and indexing shells out to `qmd`.
+Lantern is a thin client: `src/qmd/` holds the qmd integration (`QmdClient` for the HTTP query/daemon, `QmdCli` for indexing commands, `QmdService` to orchestrate them), `src/agent/` holds the chat agent (`LlmClient`, `AgentLoop`, tools, prompts), and `src/ui/` is the Obsidian view + settings. Queries use Obsidian's `requestUrl` and indexing launches the user's `qmd`. The bundle includes `cross-spawn` and its small supporting dependencies for Windows launcher compatibility. `src/qmd/shell.ts` uses native `execFile` for UTF-8 output handling, with a focused Windows shim adapter relying on pinned `cross-spawn` 7.0.6 internals; it is not a general Node process API replacement.
 
 ## Credits
 
