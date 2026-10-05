@@ -300,6 +300,20 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.
 		}
 	});
 
+	it.each(["stdout", "stderr"])("does not report a cleanup failure when the command exits right after %s overflow", async (stream) => {
+		// The tree is usually gone before taskkill runs, which it reports as
+		// exit code 128 ("process not found").
+		const script = join(directory, `fast exit ${stream}.cjs`);
+		const shim = join(directory, `fast exit ${stream}.cmd`);
+		writeFileSync(script, `process.${stream}.write("x".repeat(4096))`);
+		writeFileSync(shim, readFileSync(shims["global-npm"], "utf8").split(echoScript).join(script));
+		const result = await withDeadline(run(shim, [], { maxBuffer: 64 }));
+		expect(result.error?.code).toBe("ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+		expect(result.error?.message).not.toContain("process-tree cleanup failed");
+		await pause(100);
+		expect(result.calls).toBe(1);
+	});
+
 	it("does not terminate a successfully detached fixture daemon after its launcher exits", async () => {
 		const pidFile = join(directory, "daemon.pid");
 		const daemon = join(directory, "daemon.cjs");

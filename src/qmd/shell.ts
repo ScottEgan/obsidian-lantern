@@ -137,7 +137,9 @@ export function execFile(file: string, args: string[], options: ExecFileOptions,
 				nativeExecFile(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
 					["/PID", String(child.pid), "/T", "/F"], { windowsHide: true }, (error) => {
 						if (error) {
-							cleanupFailure = error.message;
+							// Exit code 128 means the tree had already exited (e.g. the command
+							// finished right after overflowing maxBuffer), not a failed cleanup.
+							if (error.code !== 128) cleanupFailure = error.message;
 							// A surviving descendant can hold the pipes open even after
 							// cmd.exe dies. Close them so timeout still returns diagnostics.
 							child.stdout?.destroy();
