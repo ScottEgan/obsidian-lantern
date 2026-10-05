@@ -28,6 +28,7 @@
 	"license": "MIT",
 	"devDependencies": {
 		"@eslint/js": "^9.17.0",
+		"@types/cross-spawn": "^6.0.6",
 		"@types/node": "^22.10.2",
 		"@typescript-eslint/eslint-plugin": "^8.18.2",
 		"@typescript-eslint/parser": "^8.18.2",
@@ -41,5 +42,8 @@
 		"typescript": "5.7.2",
 		"typescript-eslint": "^8.18.2",
 		"vitest": "^2.1.8"
+	},
+	"dependencies": {
+		"cross-spawn": "7.0.6"
 	}
 }

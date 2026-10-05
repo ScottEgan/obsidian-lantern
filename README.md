@@ -47,7 +47,7 @@ Lantern bundles no models or servers; you install and run all of these:
   ```
 
   `qmd --version` should report 2.8.3 or later. Older releases (≤ 2.5.3) return slugified filenames that don't map back to vault files; Lantern shows a notice on startup and flags the version in the settings status overview.
-  - **macOS** is qmd's documented platform (needs SQLite with extension support: `brew install sqlite`). **Linux** works wherever qmd runs. **Windows** is untested.
+  - **macOS** is qmd's documented platform (needs SQLite with extension support: `brew install sqlite`). **Linux** works wherever qmd runs. **Windows** launcher compatibility supports a bare `qmd` command or a full path to `qmd.cmd` (including npm/pnpm shims); this does not imply upstream qmd officially supports Windows.
 - **A stronger embedding model.** qmd's default (EmbeddingGemma-300M) is fast but shallow. Tested with **Qwen3-Embedding-4B**: much slower indexing and more RAM, materially better recall. Set this in qmd, not Lantern.
 - **For chat (optional): a local OpenAI-compatible LLM server** — llama-server (run with `--jinja` for tool calling) or LM Studio. Without one, search works fully; only the chat pane is unavailable. A hosted OpenAI-compatible API also works (OpenAI: base URL `https://api.openai.com/v1` + an API key) — at the cost of sending note content to that provider.
 - **For web search (optional):** a [Perplexity API key](https://www.perplexity.ai/settings/api) (a Pro subscription is *not* API access — it includes a $5/month API credit, then pay-as-you-go), **or** [Exa](https://exa.ai) (API key optional — without one Lantern uses Exa's free, rate-limited keyless endpoint).
@@ -170,7 +170,7 @@ The settings tab opens with a **status overview** (one-click qmd + LLM reachabil
 - **Chat with an OpenAI reasoning model doesn't think** — not a bug: gpt-5.x rejects function tools in `/v1/chat/completions` unless `reasoning_effort` is `none` ("To use function tools, use /v1/responses or set reasoning_effort to 'none'"), and the agent always sends tools. Lantern sends `none`, so the reasoning-effort setting is inert on those models. Reasoning + tools together needs the Responses API, which Lantern doesn't speak.
 - **First query is slow** — the first query after the daemon starts loads qmd's models (~3–9 s); later queries are warm.
 - **Weak search results** — use a stronger embedding model in qmd (see Requirements), enable rerank, and/or lower the minimum relevance score for more recall.
-- **Windows** — untested; expect rough edges.
+- **Windows** — Lantern handles npm/pnpm command shims, but upstream qmd's platform support is separate; expect rough edges. When launched through a Windows npm/pnpm shim, CR/LF runs in multi-line vault context are replaced with a space (both lines' text is kept). Direct executable launches and macOS/Linux preserve line breaks. Exact multi-line context on Windows would require a different launch route.
 
 ## Development
 
@@ -182,7 +182,7 @@ npm test           # run the unit tests
 npm run lint
 ```
 
-Lantern is a thin client: `src/qmd/` holds the qmd integration (`QmdClient` for the HTTP query/daemon, `QmdCli` for indexing commands, `QmdService` to orchestrate them), `src/agent/` holds the chat agent (`LlmClient`, `AgentLoop`, tools, prompts), and `src/ui/` is the Obsidian view + settings. There are no bundled runtime dependencies — queries use Obsidian's `requestUrl` and indexing shells out to `qmd`.
+Lantern is a thin client: `src/qmd/` holds the qmd integration (`QmdClient` for the HTTP query/daemon, `QmdCli` for indexing commands, `QmdService` to orchestrate them), `src/agent/` holds the chat agent (`LlmClient`, `AgentLoop`, tools, prompts), and `src/ui/` is the Obsidian view + settings. Queries use Obsidian's `requestUrl` and indexing launches the user's `qmd`. The bundle includes `cross-spawn` and its small supporting dependencies for Windows launcher compatibility. `src/qmd/shell.ts` uses native `execFile` for UTF-8 output handling, with a focused Windows shim adapter relying on pinned `cross-spawn` 7.0.6 internals; it is not a general Node process API replacement.
 
 ## Credits
 

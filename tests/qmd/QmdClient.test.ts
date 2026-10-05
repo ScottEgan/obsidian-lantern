@@ -1,10 +1,12 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { EventEmitter } from "events";
 
-// QmdClient imports requestUrl from "obsidian" and spawn from "child_process".
+// Keep the process wrapper mocked here; shell.test.ts exercises real children.
 vi.mock("obsidian", () => ({ requestUrl: vi.fn() }));
-vi.mock("child_process", () => ({ spawn: vi.fn() }));
+vi.mock("../../src/qmd/shell", () => ({ spawn: vi.fn() }));
 
 import { requestUrl } from "obsidian";
+import { spawn } from "../../src/qmd/shell";
 import {
 	QmdClient,
 	buildQueryBody,
@@ -17,6 +19,109 @@ import {
 } from "../../src/qmd/QmdClient";
 
 const mockRequestUrl = vi.mocked(requestUrl);
+const mockSpawn = vi.mocked(spawn);
+
+describe("QmdClient daemon startup ordering", () => {
+	let client: QmdClient;
+	let child: EventEmitter & { unref: ReturnType<typeof vi.fn> };
+	const launchError = () => Object.assign(new Error("spawn qmd ENOENT"), { code: "ENOENT" });
+
+	beforeEach(() => {
+		vi.resetAllMocks();
+		vi.useFakeTimers();
+		client = new QmdClient({ port: 8181, binaryPath: "qmd" });
+		child = Object.assign(new EventEmitter(), { unref: vi.fn() });
+		mockSpawn.mockReturnValue(child as never);
+		mockRequestUrl.mockResolvedValue({ status: 503, json: {} } as never);
+	});
+
+	afterEach(() => vi.useRealTimers());
+
+	it("rejects an error before spawn immediately", async () => {
+		const starting = client.ensureRunning();
+		const rejection = expect(starting).rejects.toThrow(/Failed to start qmd daemon.*ENOENT/);
+		await vi.advanceTimersByTimeAsync(0);
+		child.emit("error", launchError());
+		child.emit("spawn"); // An out-of-order later spawn cannot reverse failure.
+		await rejection;
+		expect(child.unref).not.toHaveBeenCalled();
+	});
+
+	it("reports spawn followed by ENOENT within one 500ms poll interval", async () => {
+		const start = Date.now();
+		const starting = client.ensureRunning();
+		const rejection = expect(starting).rejects.toThrow(/Failed to start qmd daemon.*ENOENT/);
+		await vi.advanceTimersByTimeAsync(0);
+		child.emit("spawn");
+		await vi.advanceTimersByTimeAsync(0);
+		child.emit("error", launchError());
+		await vi.advanceTimersByTimeAsync(500);
+		await rejection;
+		expect(Date.now() - start).toBeLessThanOrEqual(500);
+		expect(child.unref).toHaveBeenCalledOnce();
+	});
+
+	it("requires health after a normal spawn and does not treat an exit as readiness", async () => {
+		const starting = client.ensureRunning();
+		const ready = vi.fn();
+		void starting.then(ready);
+		await vi.advanceTimersByTimeAsync(0);
+		child.emit("spawn");
+		child.emit("exit", 0);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(ready).not.toHaveBeenCalled();
+		mockRequestUrl.mockResolvedValue({ status: 200, json: { status: "ok" } } as never);
+		await vi.advanceTimersByTimeAsync(500);
+		await starting;
+		expect(ready).toHaveBeenCalledOnce();
+		expect(mockSpawn).toHaveBeenCalledWith(expect.any(String), ["mcp", "--http", "--port", "8181", "--daemon"], expect.objectContaining({ detached: true, stdio: "ignore" }));
+	});
+
+	it("accepts a healthy independent daemon even when the launcher reports an error", async () => {
+		const starting = client.ensureRunning();
+		await vi.advanceTimersByTimeAsync(0);
+		child.emit("spawn");
+		child.emit("error", launchError());
+		mockRequestUrl.mockResolvedValue({ status: 200, json: { status: "ok" } } as never);
+		await starting;
+	});
+
+	it("reports a genuine health timeout without a launch error", async () => {
+		const starting = client.ensureRunning(1500);
+		const rejection = expect(starting).rejects.toThrow(/did not become healthy.*1500ms/);
+		await vi.advanceTimersByTimeAsync(0);
+		child.emit("spawn");
+		await vi.advanceTimersByTimeAsync(1500);
+		await rejection;
+	});
+
+	it("shares one startup between concurrent callers and can retry after failure", async () => {
+		const first = client.ensureRunning();
+		const second = client.ensureRunning();
+		const rejections = [expect(first).rejects.toThrow(/ENOENT/), expect(second).rejects.toThrow(/ENOENT/)];
+		await vi.advanceTimersByTimeAsync(0);
+		expect(mockSpawn).toHaveBeenCalledOnce();
+		child.emit("spawn");
+		child.emit("error", launchError());
+		await vi.advanceTimersByTimeAsync(500);
+		await Promise.all(rejections);
+
+		child = Object.assign(new EventEmitter(), { unref: vi.fn() });
+		mockSpawn.mockReturnValue(child as never);
+		const retry = client.ensureRunning();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(mockSpawn).toHaveBeenCalledTimes(2);
+		child.emit("spawn");
+		mockRequestUrl.mockResolvedValue({ status: 200, json: { status: "ok" } } as never);
+		await retry;
+	});
+
+	it("does not launch a process if the daemon is already healthy", async () => {
+		mockRequestUrl.mockResolvedValue({ status: 200, json: { status: "ok" } } as never);
+		await client.ensureRunning();
+		expect(mockSpawn).not.toHaveBeenCalled();
+	});
+});
 
 describe("buildQueryBody", () => {
 	it("sends lexical + vector sub-queries for hybrid (default)", () => {

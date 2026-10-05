@@ -6,7 +6,7 @@
  * These commands mutate qmd's global index (~/.cache/qmd/index.sqlite).
  */
 
-import { execFile } from "child_process";
+import { execFile } from "./shell";
 import { commandCwd, commandEnv, resolveCommand } from "./processEnv";
 
 export interface QmdCliConfig {
@@ -139,7 +139,7 @@ export class QmdCli {
 				{ timeout: timeoutMs, maxBuffer: MAX_BUFFER, env: commandEnv(), cwd: commandCwd() },
 				(error, stdout, stderr) => {
 					const out = stdout?.toString() ?? "";
-					const err = stderr?.toString() ?? "";
+					let err = stderr?.toString() ?? "";
 
 					// execFile sets `code` to "ENOENT" (string) for a missing binary,
 					// or the numeric exit code for a non-zero exit.
@@ -156,6 +156,11 @@ export class QmdCli {
 					}
 
 					const code = typeof rawCode === "number" ? rawCode : error ? 1 : 0;
+					// Wrapper failures must remain visible even if qmd produced partial
+					// output. Ordinary numeric failures retain qmd's own diagnostics.
+					if (error && (typeof rawCode !== "number" || (!out.trim() && !err.trim()))) {
+						err = [err.trimEnd(), error.message].filter(Boolean).join("\n");
+					}
 					resolve({ code, stdout: out, stderr: err });
 				}
 			);
@@ -204,8 +209,9 @@ export class QmdCli {
 	/**
 	 * Attach a human-written context summary to a collection root, improving
 	 * ranking (`qmd context add qmd://<name>/ "<text>"`). Re-adding the root
-	 * overwrites (qmd keys contexts by path prefix). Args go through execFile's
-	 * argv (no shell), so the text is passed literally — no quoting needed.
+	 * overwrites (qmd keys contexts by path prefix). Callers pass unquoted argv;
+	 * the launch adapter handles Windows npm/pnpm shim escaping and flattens
+	 * CR/LF runs to spaces on that route only. Direct launches preserve text.
 	 */
 	async setContext(collection: string, text: string): Promise<QmdExecResult> {
 		return this.run(["context", "add", `qmd://${collection}/`, text], LIST_TIMEOUT_MS);

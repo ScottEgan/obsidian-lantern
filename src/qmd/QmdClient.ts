@@ -22,7 +22,7 @@
  */
 
 import { requestUrl } from "obsidian";
-import { spawn } from "child_process";
+import { spawn } from "./shell";
 import { commandCwd, commandEnv, resolveCommand } from "./processEnv";
 import { truncate, decodeUriSafe } from "../util";
 
@@ -145,6 +145,11 @@ export function buildGetBody(file: string): Record<string, unknown> {
 			},
 		},
 	};
+}
+
+interface DaemonLaunch {
+	/** A launcher can emit error after spawn on Windows. */
+	error?: Error;
 }
 
 interface McpGetResponse {
@@ -334,13 +339,15 @@ export class QmdClient {
 	}
 
 	private async startAndPoll(timeoutMs: number): Promise<void> {
-		await this.spawnDaemon();
+		const launch = await this.spawnDaemon();
 
 		const start = Date.now();
 		while (Date.now() - start < timeoutMs) {
 			if (await this.isRunning()) return;
+			if (launch.error) throw launch.error;
 			await delay(500);
 		}
+		if (launch.error) throw launch.error;
 		throw new Error(
 			`qmd daemon did not become healthy on port ${this.config.port} within ${timeoutMs}ms`
 		);
@@ -434,9 +441,10 @@ export class QmdClient {
 	}
 
 	/** Start the qmd HTTP daemon as a detached process. */
-	private spawnDaemon(): Promise<void> {
+	private spawnDaemon(): Promise<DaemonLaunch> {
 		return new Promise((resolve, reject) => {
-			let settled = false;
+			let spawned = false;
+			const launch: DaemonLaunch = {};
 			const args = ["mcp", "--http", "--port", String(this.config.port), "--daemon"];
 
 			const child = spawn(resolveCommand(this.config.binaryPath), args, {
@@ -446,21 +454,18 @@ export class QmdClient {
 				cwd: commandCwd(),
 			});
 
-			child.once("error", (err: Error) => {
-				if (settled) return;
-				settled = true;
-				reject(
-					new Error(
-						`Failed to start qmd daemon ("${this.config.binaryPath} ${args.join(" ")}"): ${err.message}`
-					)
+			child.on("error", (err: Error) => {
+				launch.error ??= new Error(
+					`Failed to start qmd daemon ("${this.config.binaryPath} ${args.join(" ")}"): ${err.message}`
 				);
+				if (!spawned) reject(launch.error);
 			});
 
 			child.once("spawn", () => {
+				if (launch.error) return;
+				spawned = true;
 				child.unref();
-				if (settled) return;
-				settled = true;
-				resolve();
+				resolve(launch);
 			});
 		});
 	}

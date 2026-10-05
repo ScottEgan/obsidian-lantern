@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-vi.mock("child_process", () => ({ execFile: vi.fn() }));
+vi.mock("../../src/qmd/shell", () => ({ execFile: vi.fn() }));
 
-import { execFile } from "child_process";
+import { execFile } from "../../src/qmd/shell";
 import { homedir } from "os";
 import {
 	QmdCli,
@@ -184,6 +184,25 @@ describe("QmdCli", () => {
 	it("listCollectionNames throws when the CLI fails", async () => {
 		mockExec(Object.assign(new Error("exited"), { code: 2 }), "", "config corrupted");
 		await expect(cli.listCollectionNames()).rejects.toThrow(/collection list failed: config corrupted/);
+	});
+
+	it.each(["ETIMEDOUT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"])("keeps %s diagnostics visible even with partial output", async (code) => {
+		mockExec(Object.assign(new Error("wrapper failure details"), { code }), "partial stdout", "partial stderr");
+		const result = await cli.update();
+		expect(result).toEqual({ code: 1, stdout: "partial stdout", stderr: "partial stderr\nwrapper failure details" });
+	});
+
+	it("uses the error message when a numeric failure has no output", async () => {
+		mockExec(Object.assign(new Error("command failed without output"), { code: 7 }));
+		expect(await cli.update()).toEqual({ code: 7, stdout: "", stderr: "command failed without output" });
+	});
+
+	it("preserves indexing's no-timeout policy and the short-command timeout/output limit", async () => {
+		mockExec(null);
+		await cli.embed();
+		expect(mockExecFile.mock.calls[0][2]).toMatchObject({ timeout: 0, maxBuffer: 64 * 1024 * 1024 });
+		await cli.version();
+		expect(mockExecFile.mock.calls[1][2]).toMatchObject({ timeout: 15000, maxBuffer: 64 * 1024 * 1024 });
 	});
 
 	it("version runs qmd --version", async () => {
